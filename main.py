@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry, SamPredictor
 from gptq import *
-from modelutils import *
+from utils.modelutils import *
 from quant import *
 
 
@@ -214,7 +214,7 @@ def llama_eval(model, testenc, dev):
 
 if __name__ == '__main__':
     import argparse
-    from datautils import *
+    from utils.datautils import *
 
     parser = argparse.ArgumentParser()
 

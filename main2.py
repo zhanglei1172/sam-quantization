@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 import requests
 from PIL import Image
 
@@ -12,9 +13,9 @@ from transformers import SamModel, SamProcessor
 # from datasets import DownloadConfig
 
 from gptq import *
-from modelutils import *
+from utils.modelutils import *
 from quant import *
-from utils import *
+from utils.utils import *
 
 # img_url = "https://huggingface.co/ybelkada/segment-anything/resolve/main/assets/car.png"
 raw_image = Image.open("car.png").convert("RGB")
@@ -82,6 +83,112 @@ def quantize_vision_encoder(model, testloader, dev):
 
 
 @torch.no_grad()
+def quantize_prompt_encoder(
+    model, dev, input_points=None, input_labels=None, input_boxes=None, input_masks=None
+):
+    layer = model.to(dev)
+    torch.cuda.empty_cache()
+    sparse_embeddings = None
+    batch_size = 1
+    target_device = layer.shared_embedding.positional_embedding.device
+    if input_points is not None:
+        batch_size, point_batch_size = input_points.shape[:2]
+        if input_labels is None:
+            raise ValueError("If points are provided, labels must also be provided.")
+        point_embeddings = layer._embed_points(
+            input_points, input_labels, pad=(input_boxes is None)
+        )
+        sparse_embeddings = point_embeddings
+    if input_boxes is not None:
+        batch_size = input_boxes.shape[0]
+        box_embeddings = layer._embed_boxes(input_boxes)
+        if sparse_embeddings is None:
+            sparse_embeddings = box_embeddings
+        else:
+            sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=2)
+    if input_masks is not None:
+        layer, inps, dense_embeddings = quantize_layer(
+            layer.mask_embed, input_masks, len(input_masks), dev
+        )
+        dense_embeddings = torch.cat(dense_embeddings, dim=0)
+    else:
+        dense_embeddings = layer.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            batch_size, -1, layer.image_embedding_size[0], layer.image_embedding_size[1]
+        )
+
+    if sparse_embeddings is None:
+        sparse_embeddings = torch.zeros(
+            (batch_size, 1, 1, layer.hidden_size), device=target_device
+        )
+    # sparse_embeddings, dense_embeddings = layer.prompt_encoder(
+    #     input_points=input_points,
+    #     input_labels=input_labels,
+    #     input_boxes=input_boxes,
+    #     input_masks=input_masks,
+    # )
+    model = layer.cpu()
+    del layer
+    torch.cuda.empty_cache()
+    return sparse_embeddings, dense_embeddings
+
+
+@torch.no_grad()
+def quantize_mask_decoder(
+    model,
+    dev,
+    image_embeddings,
+    image_positional_embeddings,
+    sparse_prompt_embeddings,
+    dense_prompt_embeddings,
+    multimask_output=False,
+    output_attentions: Optional[bool] = None,
+    attention_similarity: torch.Tensor = None,
+    target_embedding: torch.Tensor = None,
+):
+    layer = model.to(dev)
+    torch.cuda.empty_cache()
+    outs = []
+    if args.nearest:
+        subset = find_layers(layer)
+        for name in subset:
+            quantizer = Quantizer()
+            quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
+            W = subset[name].weight.data
+            quantizer.find_params(W, weight=True)
+            subset[name].weight.data = quantize(
+                W, quantizer.scale, quantizer.zero, quantizer.maxq
+            ).to(next(iter(layer.parameters())).dtype)
+    for j in range(len(image_embeddings)):
+        outs.append(
+            layer(
+                image_embeddings=image_embeddings[j : j + 1],
+                image_positional_embeddings=image_positional_embeddings,
+                sparse_prompt_embeddings=sparse_prompt_embeddings[j : j + 1],
+                dense_prompt_embeddings=dense_prompt_embeddings[j : j + 1],
+                multimask_output=multimask_output,
+                output_attentions=output_attentions,
+                attention_similarity=attention_similarity,
+                target_embedding=target_embedding,
+            )
+        )
+    low_res_masks, iou_predictions, mask_decoder_attentions = zip(*outs)
+    torch.cuda.empty_cache()
+
+    model = layer.cpu()
+    del layer
+    torch.cuda.empty_cache()
+    return (
+        torch.cat(low_res_masks, dim=0),
+        torch.cat(iou_predictions, dim=0),
+        (
+            None
+            if output_attentions is None
+            else torch.cat(mask_decoder_attentions, dim=0)
+        ),
+    )
+
+
+@torch.no_grad()
 def model_eval(model, testloader, dev):
     print("Evaluating ...")
 
@@ -104,20 +211,37 @@ def model_eval(model, testloader, dev):
     input_labels = None
     input_masks = None
     input_boxes = torch.concat([x["input_boxes"] for x in testloader], dim=0).to(dev)
-    sparse_embeddings, dense_embeddings = model.prompt_encoder(
+    # sparse_embeddings, dense_embeddings = model.prompt_encoder(
+    #     input_points=input_points,
+    #     input_labels=input_labels,
+    #     input_boxes=input_boxes,
+    #     input_masks=input_masks,
+    # )
+    sparse_embeddings, dense_embeddings = quantize_prompt_encoder(
+        model.prompt_encoder,
+        dev,
         input_points=input_points,
         input_labels=input_labels,
         input_boxes=input_boxes,
         input_masks=input_masks,
     )
-    image_positional_embeddings = model.get_image_wide_positional_embeddings()
+    image_positional_embeddings = model.get_image_wide_positional_embeddings().to(dev)
     image_positional_embeddings = image_positional_embeddings.repeat(1, 1, 1, 1)
 
-    low_res_masks, iou_predictions, mask_decoder_attentions = model.mask_decoder(
-        image_embeddings=image_embeddings,
-        image_positional_embeddings=image_positional_embeddings,
-        sparse_prompt_embeddings=sparse_embeddings,
-        dense_prompt_embeddings=dense_embeddings,
+    # low_res_masks, iou_predictions, mask_decoder_attentions = model.mask_decoder(
+    #     image_embeddings=image_embeddings,
+    #     image_positional_embeddings=image_positional_embeddings,
+    #     sparse_prompt_embeddings=sparse_embeddings,
+    #     dense_prompt_embeddings=dense_embeddings,
+    #     multimask_output=False,
+    # )
+    low_res_masks, iou_predictions, mask_decoder_attentions = quantize_mask_decoder(
+        model.mask_decoder,
+        dev,
+        image_embeddings,
+        image_positional_embeddings,
+        sparse_embeddings,
+        dense_embeddings,
         multimask_output=False,
     )
 
@@ -213,7 +337,7 @@ def eval_origin(model, testloader, dev):
 
 if __name__ == "__main__":
     import argparse
-    from datautils import *
+    from utils.datautils import *
 
     parser = argparse.ArgumentParser()
 
