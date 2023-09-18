@@ -131,7 +131,7 @@ def quantize_prompt_encoder(model, dev, points=None, boxes=None, masks=None):
         sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
     if masks is not None:
-        layer, inps, dense_embeddings = quantize_layer(layer._embed_masks, masks, len(masks), dev)
+        layer, inps, dense_embeddings = quantize_layer(layer.mask_downscaling, masks, len(masks), dev)
         dense_embeddings = torch.cat(dense_embeddings, dim=0)
     else:
         dense_embeddings = model.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
