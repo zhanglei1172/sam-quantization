@@ -42,3 +42,7 @@ yarn.lock
 package-lock.json
 
 *.png
+checkpoints/
+saved_csvs/
+saved_imgs/
+datasets/

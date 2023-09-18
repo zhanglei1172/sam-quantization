@@ -124,3 +124,49 @@ class BasePredictor(object):
     def set_states(self, states):
         self._set_transform_states(states['transform_states'])
         self.prev_prediction = states['prev_prediction']
+
+        
+class SAMPredictor(BasePredictor):
+    def __init__(self, model, device, processor, **kwargs):
+        super(SAMPredictor, self).__init__(model, device, **kwargs)
+        self.transforms = []
+        self.processor = processor
+
+    def _get_prediction(self, image_nd, clicks_lists, is_image_changed):
+        points_nd = self.get_points_nd(clicks_lists)
+        return self.net(image_nd, points_nd)['instances']
+
+    def set_input_image(self, image):
+        super().set_input_image(image)
+        self.image_embedding = self.net.image_encoder(image)
+        
+    def get_prediction(self, clicker, prev_mask=None):
+        clicks_list = clicker.get_clicks()
+
+        if self.click_models is not None:
+            model_indx = min(clicker.click_indx_offset + len(clicks_list), len(self.click_models)) - 1
+            if model_indx != self.model_indx:
+                self.model_indx = model_indx
+                self.net = self.click_models[model_indx]
+
+        input_image = self.original_image
+        if prev_mask is None:
+            prev_mask = self.prev_prediction
+        if hasattr(self.net, 'with_prev_mask') and self.net.with_prev_mask:
+            input_image = torch.cat((input_image, prev_mask), dim=1)
+        image_nd, clicks_lists, is_image_changed = self.apply_transforms(
+            input_image, [clicks_list]
+        )
+
+        pred_logits = self._get_prediction(image_nd, clicks_lists, is_image_changed)
+        prediction = F.interpolate(pred_logits, mode='bilinear', align_corners=False,
+                                   size=image_nd.size()[2:])
+
+        for t in reversed(self.transforms):
+            prediction = t.inv_transform(prediction)
+
+        if self.zoom_in is not None and self.zoom_in.check_possible_recalculation():
+            return self.get_prediction(clicker)
+
+        self.prev_prediction = prediction
+        return prediction.cpu().numpy()[0, 0]

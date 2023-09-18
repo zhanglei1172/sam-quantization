@@ -290,6 +290,10 @@ def model_eval(model, testloader, dev):
         break
     l = torch.mean(torch.stack(losses))
     print(l.item())
+    # torch.save(model.state_dict(), "sam.pt")
+    # torch.save(model.state_dict(), "./checkpoints/sam-w4.pt")
+    # model.save_pretrained("./checkpoints/sam-w4")
+    # save to huggingface weights:
 
 
 @torch.no_grad()

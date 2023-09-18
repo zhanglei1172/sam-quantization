@@ -3,7 +3,7 @@ import math
 import random
 import numpy as np
 from functools import lru_cache
-from sample import DSample
+from .sample import DSample
 
 np.bool = np.bool_
 

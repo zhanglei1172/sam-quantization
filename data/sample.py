@@ -1,6 +1,6 @@
 import numpy as np
 from copy import deepcopy
-from misc import get_labels_with_sizes
+from utils.misc import get_labels_with_sizes
 from data.transforms import remove_image_only_transforms
 from albumentations import ReplayCompose
 
@@ -57,6 +57,12 @@ class DSample:
         self.remove_small_objects(min_area=1)
 
         self._augmented = True
+    
+    def process_sample(self, processor):
+        inputs = processor(self.image, return_tensors="pt")
+        self.image = inputs['pixel_values'][0].numpy().transpose(1, 2, 0)
+        
+        
 
     def reset_augmentation(self):
         if not self._augmented:
