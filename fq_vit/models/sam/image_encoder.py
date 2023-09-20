@@ -10,7 +10,8 @@ import torch.nn.functional as F
 
 from typing import Optional, Tuple, Type
 
-from .common import LayerNorm2d, MLPBlock
+from ..ptq import QAct, QConv2d, QIntLayerNorm, QIntSoftmax, QLinear
+from .common import MLPBlock, QIntLayerNorm2D
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -33,6 +34,10 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        quant=False,
+        calibrate=False,
+        input_quant=False,
+        cfg=None,
     ) -> None:
         """
         Args:
@@ -54,20 +59,62 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
-
+        self.cfg = cfg
+        self.input_quant = input_quant
+        if input_quant:
+            self.qact_input = QAct(
+                quant=quant,
+                calibrate=calibrate,
+                bit_type=cfg.BIT_TYPE_A,
+                calibration_mode=cfg.CALIBRATION_MODE_A,
+                observer_str=cfg.OBSERVER_A,
+                quantizer_str=cfg.QUANTIZER_A,
+                permute=False,
+            )
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
             stride=(patch_size, patch_size),
             in_chans=in_chans,
             embed_dim=embed_dim,
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg,
         )
 
         self.pos_embed: Optional[nn.Parameter] = None
         if use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
             self.pos_embed = nn.Parameter(
-                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+                torch.zeros(
+                    1, img_size // patch_size, img_size // patch_size, embed_dim
+                )
             )
+        # self.qact_embed = QAct(
+        #     quant=quant,
+        #     calibrate=calibrate,
+        #     bit_type=cfg.BIT_TYPE_A,
+        #     calibration_mode=cfg.CALIBRATION_MODE_A,
+        #     observer_str=cfg.OBSERVER_A,
+        #     quantizer_str=cfg.QUANTIZER_A,
+        # )
+        self.qact_pos = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+            permute=False,
+        )
+        self.qact1 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+            observer_str=cfg.OBSERVER_A_LN,
+            quantizer_str=cfg.QUANTIZER_A_LN,
+            permute=False,
+        )
 
         self.blocks = nn.ModuleList()
         for i in range(depth):
@@ -82,61 +129,89 @@ class ImageEncoderViT(nn.Module):
                 rel_pos_zero_init=rel_pos_zero_init,
                 window_size=window_size if i not in global_attn_indexes else 0,
                 input_size=(img_size // patch_size, img_size // patch_size),
+                quant=quant,
+                calibrate=calibrate,
+                cfg=cfg,
             )
             self.blocks.append(block)
 
-        self.neck = nn.Sequential(
-            nn.Conv2d(
-                embed_dim,
-                out_chans,
-                kernel_size=1,
-                bias=False,
-            ),
-            LayerNorm2d(out_chans),
-            nn.Conv2d(
-                out_chans,
-                out_chans,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            LayerNorm2d(out_chans),
+        self.neck = nn.ModuleList(
+            [
+                QConv2d(
+                    embed_dim,
+                    out_chans,
+                    kernel_size=1,
+                    bias=False,
+                    quant=quant,
+                    calibrate=calibrate,
+                    bit_type=cfg.BIT_TYPE_W,
+                    calibration_mode=cfg.CALIBRATION_MODE_W,
+                    observer_str=cfg.OBSERVER_W,
+                    quantizer_str=cfg.QUANTIZER_W,
+                ),
+                QIntLayerNorm2D(out_chans),
+                QConv2d(
+                    out_chans,
+                    out_chans,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                    quant=quant,
+                    calibrate=calibrate,
+                    bit_type=cfg.BIT_TYPE_W,
+                    calibration_mode=cfg.CALIBRATION_MODE_W,
+                    observer_str=cfg.OBSERVER_W,
+                    quantizer_str=cfg.QUANTIZER_W,
+                ),
+                QIntLayerNorm2D(out_chans),
+            ]
+        )
+        self.qacts = nn.ModuleList(
+            [
+                QAct(
+                    quant=quant,
+                    calibrate=calibrate,
+                    bit_type=cfg.BIT_TYPE_A,
+                    calibration_mode=cfg.CALIBRATION_MODE_A,
+                    observer_str=cfg.OBSERVER_A,
+                    quantizer_str=cfg.QUANTIZER_A,
+                )
+                if _ not in (0, 2)
+                else QAct(
+                    quant=quant,
+                    calibrate=calibrate,
+                    bit_type=cfg.BIT_TYPE_A,
+                    calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+                    observer_str=cfg.OBSERVER_A_LN,
+                    quantizer_str=cfg.QUANTIZER_A_LN,
+                )
+                for _ in range(4)
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_quant:
+            x = self.qact_input(x)
         x = self.patch_embed(x)
+        # x = self.qact_embed(x)
         if self.pos_embed is not None:
-            x = x + self.pos_embed
-        # i = 0
-        for blk in self.blocks:
-            # plot(x, i)
-            x = blk(x)
-            # i += 1
+            x = x + self.qact_pos(self.pos_embed)
+        x = self.qact1(x)
+        for i, blk in enumerate(self.blocks):
+            last_quantizer = (
+                self.qact1.quantizer if i == 0 else self.blocks[i - 1].qact4.quantizer
+            )
+            x = blk(x, last_quantizer)
 
-        x = self.neck(x.permute(0, 3, 1, 2))
+        x = x.permute(0, 3, 1, 2)
+        for i, mod in enumerate(self.neck):
+            if isinstance(mod, QIntLayerNorm2D):
+                x = self.qacts[i](mod(x, self.qacts[i - 1].quantizer))
+            else:
+                x = self.qacts[i](mod(x))
 
         return x
 
-def plot(x, i):
-    import numpy as np
-
-    # x : (1, 16, 16, 1280)
-    # plot per-channel range(min and max)
-    import matplotlib.pyplot as plt
-    plt.figure()
-    x = x.cpu().detach().numpy()
-    x = x.reshape(-1, x.shape[-1])
-    xmin = x.min(axis=0)
-    xmax = x.max(axis=0)
-    plt.plot(xmin, label="min")
-    plt.plot(xmax, label="max")
-    # plt.plot(np.abs(x).max(axis=0), label="abs_max")
-    # plt.plot(np.abs(x).min(axis=0), label="abs_min")
-    plt.legend()
-    plt.show()
-    plt.savefig(f"boxplot_{i}.png")
-    plt.close()
-    
 
 class Block(nn.Module):
     """Transformer blocks with support of window attention and residual propagation blocks"""
@@ -153,6 +228,9 @@ class Block(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         input_size: Optional[Tuple[int, int]] = None,
+        quant=False,
+        calibrate=False,
+        cfg=None,
     ) -> None:
         """
         Args:
@@ -171,6 +249,15 @@ class Block(nn.Module):
         """
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.qact1 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+            permute=False,
+        )
         self.attn = Attention(
             dim,
             num_heads=num_heads,
@@ -178,16 +265,51 @@ class Block(nn.Module):
             use_rel_pos=use_rel_pos,
             rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size),
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg,
         )
-
+        self.qact2 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+            observer_str=cfg.OBSERVER_A_LN,
+            quantizer_str=cfg.QUANTIZER_A_LN,
+            permute=False,
+        )
         self.norm2 = norm_layer(dim)
-        self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
-
+        self.qact3 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+            permute=False,
+        )
+        self.mlp = MLPBlock(
+            embedding_dim=dim,
+            mlp_dim=int(dim * mlp_ratio),
+            act=act_layer,
+            quant=quant,
+            calibrate=calibrate,
+            cfg=cfg,
+        )
+        self.qact4 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A_LN,
+            observer_str=cfg.OBSERVER_A_LN,
+            quantizer_str=cfg.QUANTIZER_A_LN,
+            permute=False,
+        )
         self.window_size = window_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, last_quantizer=None) -> torch.Tensor:
         shortcut = x
-        x = self.norm1(x)
+        x = self.qact1(self.norm1(x, last_quantizer, self.qact1.quantizer))
         # Window partition
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
@@ -198,8 +320,13 @@ class Block(nn.Module):
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
-        x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
+        x = self.qact2(shortcut + x)
+        x = self.qact4(
+            x
+            + self.mlp(
+                self.qact3(self.norm2(x, self.qact2.quantizer, self.qact3.quantizer))
+            )
+        )
 
         return x
 
@@ -215,6 +342,9 @@ class Attention(nn.Module):
         use_rel_pos: bool = False,
         rel_pos_zero_init: bool = True,
         input_size: Optional[Tuple[int, int]] = None,
+        quant=False,
+        calibrate=False,
+        cfg=None,
     ) -> None:
         """
         Args:
@@ -231,9 +361,61 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
+        self.qkv = QLinear(
+            dim,
+            dim * 3,
+            bias=qkv_bias,
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_W,
+            calibration_mode=cfg.CALIBRATION_MODE_W,
+            observer_str=cfg.OBSERVER_W,
+            quantizer_str=cfg.QUANTIZER_W,
+        )
+        self.qact_attn1 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+        )
+        self.qact1 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+        )
+        self.qact2 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+            permute=False,
+        )
+        self.proj = QLinear(
+            dim,
+            dim,
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_W,
+            calibration_mode=cfg.CALIBRATION_MODE_W,
+            observer_str=cfg.OBSERVER_W,
+            quantizer_str=cfg.QUANTIZER_W,
+        )
+        self.qact3 = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
+            permute=False,
+        )
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
             assert (
@@ -242,40 +424,63 @@ class Attention(nn.Module):
             # initialize relative positional embeddings
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
+            self.use_rel_pos_qact = QAct(
+                quant=quant,
+                calibrate=calibrate,
+                bit_type=cfg.BIT_TYPE_A,
+                calibration_mode=cfg.CALIBRATION_MODE_A,
+                observer_str=cfg.OBSERVER_A,
+                quantizer_str=cfg.QUANTIZER_A,
+            )
+        self.log_int_softmax = QIntSoftmax(
+            log_i_softmax=cfg.INT_SOFTMAX,
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_S,
+            calibration_mode=cfg.CALIBRATION_MODE_S,
+            observer_str=cfg.OBSERVER_S,
+            quantizer_str=cfg.QUANTIZER_S,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qact1(self.qkv(x.reshape(B, H * W, _)))
+            .reshape(B, H * W, 3, self.num_heads, -1)
+            .permute(2, 0, 3, 1, 4)
+        )
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         attn = (q * self.scale) @ k.transpose(-2, -1)
-
+        attn = self.qact_attn1(attn)
+        last_quantizer = self.qact_attn1.quantizer
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn = add_decomposed_rel_pos(
+                attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+            )
+            attn = self.use_rel_pos_qact(attn)
+            last_quantizer = self.use_rel_pos_qact.quantizer
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        # attn = attn.softmax(dim=-1)
+        attn = self.log_int_softmax(attn, last_quantizer.scale)
+        x = (
+            (attn @ v)
+            .view(B, self.num_heads, H, W, -1)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(B, H, W, -1)
+        )
+        x = self.qact2(x)
         x = self.proj(x)
+        x = self.qact3(x)
 
         return x
 
-def plot_attention(x):
-    # x: (400, 196, 196)
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    plt.figure()
-    # plot value distribution
-    x = x.cpu().detach().numpy()
-    x = np.log(x).reshape(-1)
-    plt.hist(x, bins=100)
-    plt.savefig("attention.png")
-    plt.clf()
-    
 
-def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+def window_partition(
+    x: torch.Tensor, window_size: int
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
     Args:
@@ -295,12 +500,17 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     Hp, Wp = H + pad_h, W + pad_w
 
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    windows = (
+        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    )
     return windows, (Hp, Wp)
 
 
 def window_unpartition(
-    windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
+    windows: torch.Tensor,
+    window_size: int,
+    pad_hw: Tuple[int, int],
+    hw: Tuple[int, int],
 ) -> torch.Tensor:
     """
     Window unpartition into original sequences and removing padding.
@@ -316,7 +526,9 @@ def window_unpartition(
     Hp, Wp = pad_hw
     H, W = hw
     B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
+    x = windows.view(
+        B, Hp // window_size, Wp // window_size, window_size, window_size, -1
+    )
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
     if Hp > H or Wp > W:
@@ -390,7 +602,9 @@ def add_decomposed_rel_pos(
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
     attn = (
-        attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
+        attn.view(B, q_h, q_w, k_h, k_w)
+        + rel_h[:, :, :, :, None]
+        + rel_w[:, :, :, None, :]
     ).view(B, q_h * q_w, k_h * k_w)
 
     return attn
@@ -408,6 +622,9 @@ class PatchEmbed(nn.Module):
         padding: Tuple[int, int] = (0, 0),
         in_chans: int = 3,
         embed_dim: int = 768,
+        quant=False,
+        calibrate=False,
+        cfg=None,
     ) -> None:
         """
         Args:
@@ -419,12 +636,31 @@ class PatchEmbed(nn.Module):
         """
         super().__init__()
 
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
+        self.proj = QConv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_W,
+            calibration_mode=cfg.CALIBRATION_MODE_W,
+            observer_str=cfg.OBSERVER_W,
+            quantizer_str=cfg.QUANTIZER_W,
+        )
+        self.qact = QAct(
+            quant=quant,
+            calibrate=calibrate,
+            bit_type=cfg.BIT_TYPE_A,
+            calibration_mode=cfg.CALIBRATION_MODE_A,
+            observer_str=cfg.OBSERVER_A,
+            quantizer_str=cfg.QUANTIZER_A,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         # B C H W -> B H W C
+        x = self.qact(x)
         x = x.permute(0, 2, 3, 1)
         return x

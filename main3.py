@@ -402,6 +402,6 @@ if __name__ == "__main__":
     )
 
     # eval_origin(model, testloader, DEV)
-    quantize_model(model, train_data, DEV)
+    # quantize_model(model, train_data, DEV)
     # model.load_state_dict(torch.load(f"./checkpoints/sam-{args.wbits}.pt"))
-    # main(model.to(DEV), val_data, args, device)
+    main(model.to(DEV), val_data, args, device)
