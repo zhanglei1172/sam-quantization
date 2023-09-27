@@ -364,6 +364,7 @@ if __name__ == "__main__":
     device = "cuda"
     mt = "vit_h"
     model = sam_model_registry[mt](checkpoint=model_type[mt])
+    
     # model = get_llama(args.model)
     model.eval()
 

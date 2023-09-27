@@ -1,12 +1,15 @@
+import numpy as np
 import torch
 import torchvision
 import torchvision.transforms as transforms
+from pycocotools import mask as mask_utils
 from torch.utils.data import Dataset
-import numpy as np
-import json, glob, os
+
+import glob
+import json
+import os
 from PIL import Image
 
-from pycocotools import mask as mask_utils
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -109,7 +112,8 @@ def get_SA1B(path, nsamples, seed):
     traindata = SAMDataset(dir_path=path, processor=processor)
 
     import random
-    random.seed(seed)
+
+    # random.seed(seed)
     trainloader = []
     testloader = []
     for _ in range(nsamples):

@@ -239,7 +239,7 @@ def main():
         augmentator=val_augmentator,
         min_object_area=80,
         points_sampler=points_sampler,
-        epoch_len=500,
+        # epoch_len=500,
     )
     val_loader = torch.utils.data.DataLoader(
         valset,
@@ -445,7 +445,7 @@ def validate(args, val_loader, model, device):
                 img.save(f"saved_imgs/{i}_points.png")
     val_end_time = time.time()
     print(
-        " * Prec@1 {click1.avg:.3f} Prec@5 {click5.avg:.3f} Time {time:.3f}".format(
+        " * Click@1 {click1.avg:.3f} Click@5 {click5.avg:.3f} Time {time:.3f}".format(
             click1=click1, click5=click5, time=val_end_time - val_start_time
         )
     )

@@ -263,8 +263,8 @@ class Attention(nn.Module):
 
 def plot_attention(x):
     # x: (400, 196, 196)
-    import matplotlib.pyplot as plt
     import numpy as np
+    import matplotlib.pyplot as plt
     
     plt.figure()
     # plot value distribution
@@ -288,13 +288,17 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     """
     B, H, W, C = x.shape
 
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-    Hp, Wp = H + pad_h, W + pad_w
+    # pad_h = (window_size - H % window_size) % window_size # 6
+    # pad_w = (window_size - W % window_size) % window_size # 6
+    pad_h = 6
+    pad_w = 6
+    # if pad_h > 0 or pad_w > 0:
+    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h), value=0)
+    # Hp, Wp = H + pad_h, W + pad_w # 70, 70
+    Hp, Wp = 70, 70
 
-    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
+    # x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
+    x = x.view(1, 5, 14, 5, 14, 1280)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows, (Hp, Wp)
 
@@ -313,14 +317,15 @@ def window_unpartition(
     Returns:
         x: unpartitioned sequences with [B, H, W, C].
     """
-    Hp, Wp = pad_hw
-    H, W = hw
-    B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
+    Hp, Wp = 70, 70 #pad_hw # 70. 70
+    H, W = 64, 64 #hw # 64, 64
+    B = 1#windows.shape[0] // (Hp * Wp // window_size // window_size) # 1
+    # x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1) # 
+    x = windows.view(1, 5, 5, 14, 14, 1280)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
-    if Hp > H or Wp > W:
-        x = x[:, :H, :W, :].contiguous()
+    # if Hp > H or Wp > W:
+    x = x[:, :H, :W, :].contiguous()
     return x
 
 
@@ -386,8 +391,11 @@ def add_decomposed_rel_pos(
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    # or not use torch.einsum:
+    rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
+    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
 
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]

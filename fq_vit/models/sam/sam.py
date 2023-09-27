@@ -8,14 +8,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from fq_vit.models.layers_quant import trunc_normal_
 from typing import Any, Dict, List, Tuple
 
-from fq_vit.models.layers_quant import trunc_normal_
-
+from ..ptq import QAct, QConv2d, QIntLayerNorm, QIntSoftmax, QLinear
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
-from ..ptq import QAct, QConv2d, QIntLayerNorm, QIntSoftmax, QLinear
 
 
 class Sam(nn.Module):
@@ -203,7 +202,7 @@ class Sam(nn.Module):
         h, w = x.shape[-2:]
         padh = self.image_encoder.img_size - h
         padw = self.image_encoder.img_size - w
-        x = F.pad(x, (0, padw, 0, padh))
+        x = F.pad(x, (0, padw, 0, padh), value=0)
         return x
 
     def model_quant(self):

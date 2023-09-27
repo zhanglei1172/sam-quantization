@@ -46,3 +46,8 @@ checkpoints/
 saved_csvs/
 saved_imgs/
 datasets/
+
+out/
+Output/
+runs/
+*.engine
