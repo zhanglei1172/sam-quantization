@@ -185,13 +185,16 @@ class Block(nn.Module):
 
         self.window_size = window_size
 
+    # @torch.jit.script_method
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
         # Window partition
+        H, W = x.shape[1], x.shape[2]
         if self.window_size > 0:
-            H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
+        else:
+            pad_hw = (0, 0)
 
         x = self.attn(x)
         # Reverse window partition
@@ -275,6 +278,7 @@ def plot_attention(x):
     plt.clf()
     
 
+
 def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
@@ -293,7 +297,7 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     pad_h = 6
     pad_w = 6
     # if pad_h > 0 or pad_w > 0:
-    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h), value=0)
+    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h), value=0.0)
     # Hp, Wp = H + pad_h, W + pad_w # 70, 70
     Hp, Wp = 70, 70
 
@@ -302,7 +306,7 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows, (Hp, Wp)
 
-
+# @torch.jit.script
 def window_unpartition(
     windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
 ) -> torch.Tensor:
@@ -328,7 +332,7 @@ def window_unpartition(
     x = x[:, :H, :W, :].contiguous()
     return x
 
-
+# @torch.jit.script
 def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """
     Get relative positional embeddings according to the relative positions of

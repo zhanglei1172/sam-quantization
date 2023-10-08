@@ -131,7 +131,7 @@ class QConvTranspose2d(nn.ConvTranspose2d):
         # TorchScript does not support `Sequence[T]` or `Tuple[T, ...]`.
         num_spatial_dims = 2
         output_padding = self._output_padding(
-            input, output_size, self.stride, self.padding, self.kernel_size,  # type: ignore[arg-type]
+            x, output_size, self.stride, self.padding, self.kernel_size,  # type: ignore[arg-type]
             num_spatial_dims, self.dilation)  # type: ignore[arg-type]
         if not self.quant:
             return F.conv_transpose2d(
@@ -255,6 +255,7 @@ class QIntLayerNorm(nn.LayerNorm):
         return M, N
 
     def forward(self, x, in_quantizer=None, out_quantizer=None, in_scale_expand=1):
+        return super().forward(x)
         if self.mode == "ln":
             x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         elif self.mode == "int":
@@ -375,6 +376,7 @@ class QIntSoftmax(nn.Module):
         return exp_int, exp_int_sum
 
     def forward(self, x, scale):
+        return F.softmax(x, dim=-1)
         if self.log_i_softmax and scale is not None:
             exp_int, exp_int_sum = self.int_softmax(x, scale)
             softmax_out = torch.round(exp_int_sum / exp_int)

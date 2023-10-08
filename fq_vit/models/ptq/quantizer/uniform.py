@@ -7,7 +7,7 @@ from .base import BaseQuantizer
 
 class UniformQuantizer(BaseQuantizer):
 
-    def __init__(self, bit_type, observer, module_type, permute=True):
+    def __init__(self, bit_type, observer, module_type, permute=True, load_state_dict=False):
         super(UniformQuantizer, self).__init__(bit_type, observer, module_type, permute=permute)
         self.scale = None
         self.zero_point = None
@@ -15,6 +15,10 @@ class UniformQuantizer(BaseQuantizer):
     def update_quantization_params(self, *args, **kwargs):
         self.scale, self.zero_point = self.observer.get_quantization_params(
             *args, **kwargs)
+        scale, zero = self.scale, self.zero_point
+        del self.scale, self.zero_point
+        self.register_buffer('scale', (scale))
+        self.register_buffer('zero_point', (zero))
 
     def quant(self, inputs, scale=None, zero_point=None):
         if scale is None:

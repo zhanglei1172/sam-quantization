@@ -35,7 +35,7 @@ parser.add_argument(
     "--quant-method", default="minmax", choices=["minmax", "ema", "omse", "percentile"]
 )
 parser.add_argument(
-    "--calib-batchsize", default=2, type=int, help="batchsize of calibration set"
+    "--calib-batchsize", default=1, type=int, help="batchsize of calibration set"
 )
 parser.add_argument("--calib-iter", default=10, type=int)
 parser.add_argument(
@@ -291,6 +291,18 @@ def main():
         del data_list
         model.model_close_calibrate()
         model.model_quant()
+        
+        # with torch.no_grad():
+        #     torch.onnx.export(
+        #         model.image_encoder,
+        #         torch.rand(size=[1, 3, 1024, 1024]).to("cuda"),
+        #         "out/fq-vit.onnx",
+        #         export_params=True,
+        #         verbose=False,
+        #         opset_version=11,
+        #         do_constant_folding=True,
+        #     )
+    # torch.save(model.state_dict(), "saved_models/model.pt")
 
     print("Validating...")
     val_miou1, val_miou5 = validate(args, val_loader, model, device)

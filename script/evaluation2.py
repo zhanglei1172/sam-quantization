@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import torch
+
 # import albumentations as F
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -9,11 +10,16 @@ from torchvision.transforms import ToPILImage
 from segment_anything.build_sam import sam_model_registry
 
 import pandas as pd
+import tensorrt as trt
+import trt_infer
 from albumentations import *
 from data.datasets.sbd import SBDDataset
 from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from PIL import ImageDraw
+from ppq import convert_any_to_numpy, convert_any_to_torch_tensor
+from ppq.utils.TensorRTUtil import trt
+from typing import List
 
 # crop_size = (1024, 1024)
 # crop_size = (256, 16)
@@ -185,10 +191,47 @@ def get_next_click_torch(prev_seg, gt_semantic_seg):
     return batch_points, batch_labels  # , (sum(dice_list)/len(dice_list)).item()
 
 
+def infer_trt(engine, samples: List[np.ndarray]) -> List[np.ndarray]:
+    """Run a tensorrt model with given samples"""
+
+    results = []
+    with engine.create_execution_context() as context:
+        inputs, outputs, bindings, stream = trt_infer.allocate_buffers(context.engine)
+        for sample in samples:
+            inputs[0].host = convert_any_to_numpy(sample)
+            output = trt_infer.do_inference(
+                context,
+                bindings=bindings,
+                inputs=inputs,
+                outputs=outputs,
+                stream=stream,
+                batch_size=1,
+            )[0]
+            results.append(
+                convert_any_to_torch_tensor(output).reshape([-1, 256, 64, 64])
+            )
+    return results
+
+
 @torch.no_grad()
 def main(sam_model, val_data, args, device):
     all_iou = 0
     iou_list = []
+    backend = None
+    if hasattr(args, "trt_engine"):
+        backend = "ORT"
+        if args.trt_engine.endswith(".onnx"):
+            import onnxruntime
+
+            sess = onnxruntime.InferenceSession(
+                args.trt_engine, providers=["CUDAExecutionProvider"]
+            )
+            output_name = sess.get_outputs()[0].name
+        else:
+            backend = "TRT"
+            logger = trt.Logger(trt.Logger.ERROR)
+            with open(args.trt_engine, "rb") as f, trt.Runtime(logger) as runtime:
+                engine = runtime.deserialize_cuda_engine(f.read())
     for step, batch_data in enumerate(val_data):
         batch_data = {k: v.to(device) for k, v in batch_data.items()}
         images, gt_masks, points = (
@@ -198,7 +241,24 @@ def main(sam_model, val_data, args, device):
         )
         prev_masks = torch.zeros_like(gt_masks).to(device)
 
-        image_embedding = sam_model.image_encoder(images)  # (B, 256, 64, 64
+        if backend == "ORT":
+            ort_outs = sess.run(
+                output_names=[output_name],
+                input_feed={"input.1": images.cpu().numpy()},
+            )
+
+            image_embedding = (
+                convert_any_to_torch_tensor(ort_outs).squeeze().unsqueeze(0).to(device)
+            )
+            # print(image_embedding.shape)
+        elif backend == "TRT":
+            trt_outputs = infer_trt(
+                engine,
+                samples=[convert_any_to_numpy(sample) for sample in images.cpu()],
+            )
+            image_embedding = torch.cat(trt_outputs).to(device)
+        else:
+            image_embedding = sam_model.image_encoder(images)  # (B, 256, 64, 64
 
         click_points = []
         click_labels = []

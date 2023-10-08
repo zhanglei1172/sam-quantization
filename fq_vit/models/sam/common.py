@@ -105,6 +105,7 @@ class QIntLayerNorm2D(_LayerNorm2d):
                 in_quantizer=None,
                 out_quantizer=None,
                 in_scale_expand=1):
+        return super().forward(x)
         # x: [B, C, H, W]
         if self.mode == 'ln':
             x = super().forward(x)

@@ -7,7 +7,7 @@ from segment_anything.build_sam import sam_model_registry
 import os
 import ppq.lib as PFL
 import random
-from ppq import TargetPlatform, TorchExecutor, graphwise_error_analyse
+from ppq import TargetPlatform, TorchExecutor, graphwise_error_analyse, layerwise_error_analyse
 from ppq.api import ENABLE_CUDA_KERNEL, export_ppq_graph, load_onnx_graph
 from ppq.core import convert_any_to_numpy
 from ppq.quantization.optim import *
@@ -109,6 +109,14 @@ with torch.no_grad():
             collate_fn=collate_fn,
             executor=executor,
         )
+        reports = layerwise_error_analyse(
+            graph=graph,
+            running_device=DEVICE,
+            collate_fn=collate_fn,
+            dataloader=calibration_dataloader,
+        )
+        os.exit(0)
+
 
         graphwise_error_analyse(
             graph=graph,

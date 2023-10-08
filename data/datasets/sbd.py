@@ -25,7 +25,7 @@ class SBDDataset(ISDataset):
         self._buggy_mask_thresh = buggy_mask_thresh
 
         with open(self.dataset_path / f"{split}.txt", "r") as f:
-            self.dataset_samples = [x.strip() for x in f.readlines()]
+            self.dataset_samples = [x.strip() for x in f.readlines()][:500]
 
     def get_sample(self, index):
         image_name = self.dataset_samples[index]

@@ -36,7 +36,7 @@ class ImageEncoderViT(nn.Module):
         global_attn_indexes: Tuple[int, ...] = (),
         quant=False,
         calibrate=False,
-        input_quant=False,
+        input_quant=True,
         cfg=None,
     ) -> None:
         """
@@ -598,8 +598,10 @@ def add_decomposed_rel_pos(
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
+    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
 
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w)
