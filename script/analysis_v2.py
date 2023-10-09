@@ -184,6 +184,9 @@ class MyTVMQuantizer(TensorRTQuantizer):
                     gemm_weight_config.observer_algorithm = "minmax"
                     gemm_weight_config.quant_max = 127
                     gemm_weight_config.quant_min = -128
+                for inp, TQC in zip(operation.inputs, OQC.input_quantization_config):
+                    if inp.name in exclude_inps:
+                        TQC.state = QuantizationStates.FP32
 
             if operation.num_of_input > 2:
                 bias_config = OQC.input_quantization_config[-1]
@@ -198,10 +201,10 @@ class MyTVMQuantizer(TensorRTQuantizer):
             TQC.policy = QuantizationPolicy(
                 QuantizationProperty.SYMMETRICAL
                 + QuantizationProperty.LINEAR
-                + QuantizationProperty.PER_CHANNEL
+                + QuantizationProperty.PER_TENSOR
             )
-            TQC.channel_axis = operation.attributes.get("axis", -1)
-            TQC.observer_algorithm = "minmax"
+            # TQC.channel_axis = operation.attributes.get("axis", -1)
+            # TQC.observer_algorithm = "minmax"
 
         elif operation.type == "Attention":
             # Attention - Only input and weight need to be quantized.
@@ -285,13 +288,15 @@ with torch.no_grad():
 
         processor = GraphMerger(ir)
         processor.fuse_matmul_add()
+        # processor.fuse_gemm()
         processor.fuse_layernorm()
         # processor.fuse_gelu()
 
         quantizer = MyTVMQuantizer(ir)
 
-        exclued_ops = {"/patch_embed/proj/Conv"}
-        # search_engine = SearchableGraph(ir)
+        # exclued_ops = {"/patch_embed/proj/Conv"}
+        exclued_ops = set()
+        search_engine = SearchableGraph(ir)
         # for op in search_engine.opset_matching(
         #     sp_expr=lambda x: x.type == "Softmax",
         #     rp_expr=lambda x, y: y.type != "Split",
@@ -308,16 +313,30 @@ with torch.no_grad():
         # ):
         #     exclued_ops.add(op.name)
         # convert op to quantable-op
+
+        exclude_inps = set()
+        for op in search_engine.opset_matching(
+            sp_expr=lambda x: x.name.endswith("attn/Split"),
+            rp_expr=lambda x, y: not y.is_computing_op,
+            ep_expr=lambda x: x.is_computing_op,
+            direction="down",
+        ):
+            exclued_ops.add(op.name)
+            for inp in op.inputs:
+                if not inp.is_parameter:
+                    exclude_inps.add(inp.name)
+
         for name, op in ir.operations.items():
             if op.type in {
                 "Conv",
                 "ConvTranspose",
                 "MatMul",
-                "Gemm",
+                # "Gemm",
                 "PPQBiasFusedMatMul",
                 # "LayerNormalization",
             }:
-                if name not in exclued_ops:
+                # if name not in exclued_ops and "mlp" in name and "lin2" in name:
+                if "mlp" not in name:
                     quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
 
         QS = QuantizationSettingFactory.default_setting()
@@ -327,8 +346,9 @@ with torch.no_grad():
         pipeline = PFL.Pipeline(
             [
                 # LayerwiseEqualizationPass(iteration=10),
+                QuantizeSimplifyPass(),
                 ParameterQuantizePass(),
-                RuntimeCalibrationPass(),
+                RuntimeCalibrationPass(),  # TODO
                 PassiveParameterQuantizePass(),
                 # LearnedStepSizePass(
                 #     interested_layers=lsq_setting.interested_layers,
@@ -363,18 +383,18 @@ with torch.no_grad():
             graph=ir,
             dataloader=calibration_dataloader,
             verbose=True,
-            calib_steps=32,
+            calib_steps=10,
             collate_fn=collate_fn,
             executor=executor,
         )
 
-        reports = layerwise_error_analyse(
-            graph=ir,
-            running_device=DEVICE,
-            interested_outputs=["/blocks.0/Add_output_0"],
-            dataloader=calibration_dataloader,
-            collate_fn=collate_fn,
-        )
+        # reports = layerwise_error_analyse(
+        #     graph=ir,
+        #     running_device=DEVICE,
+        #     interested_outputs=["/blocks.0/Add_output_0"],
+        #     dataloader=calibration_dataloader,
+        #     collate_fn=collate_fn,
+        # )
 
         # reports = graphwise_error_analyse_v2(
         #     graph=ir,
@@ -400,16 +420,32 @@ with torch.no_grad():
             dataloader=calibration_dataloader,
         )
 
+        ana_vars = []
+        for op in ir.operations.values():
+            if "0/mlp/lin1/MatMul" in op.name or "0/mlp/lin2/MatMul" in op.name:
+                for inp in op.inputs:
+                    if not inp.is_parameter:
+                        ana_vars.append(inp.name)
+
+        variable_analyse(
+            ir,
+            interested_outputs=ana_vars,
+            running_device=DEVICE,
+            collate_fn=collate_fn,
+            dataloader=calibration_dataloader,
+            dequantize=True,
+        )
+
         export_ppq_graph(
             graph=ir,
-            # platform=TargetPlatform.TRT_INT8,
-            platform=TargetPlatform.ONNXRUNTIME,
+            platform=TargetPlatform.TRT_INT8,
+            # platform=TargetPlatform.ONNXRUNTIME,
             graph_save_to="Output/quantized.onnx",
             config_save_to="Output/quantized.json",
             save_as_external_data=True,
             # size_threshold=1024,
         )
-        # from ppq.utils.TensorRTUtil import build_engine
+        from ppq.utils.TensorRTUtil import build_engine
 
         # build_engine(
         #     onnx_file="Output/quantized.onnx",
@@ -417,5 +453,20 @@ with torch.no_grad():
         #     engine_file="Output/INT8.engine",
         #     int8=True,
         #     fp16=True,
+        #     external_data=True,
+        # )
+
+        # build_engine(
+        #     onnx_file="Output/quantized.onnx",
+        #     engine_file="Output/FP16.engine",
+        #     int8=False,
+        #     fp16=True,
+        #     external_data=True,
+        # )
+        # build_engine(
+        #     onnx_file="Output/quantized.onnx",
+        #     engine_file="Output/FP32.engine",
+        #     int8=False,
+        #     fp16=False,
         #     external_data=True,
         # )
