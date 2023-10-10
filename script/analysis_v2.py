@@ -331,13 +331,17 @@ with torch.no_grad():
                 "Conv",
                 "ConvTranspose",
                 "MatMul",
-                # "Gemm",
+                "Gemm",
                 "PPQBiasFusedMatMul",
-                # "LayerNormalization",
+                "LayerNormalization",
+                "Softmax",
             }:
                 # if name not in exclued_ops and "mlp" in name and "lin2" in name:
-                if "mlp" not in name:
-                    quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
+                # if "attn/MatMul_1" not in name and "attn/MatMul_2" not in name:
+                quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
+        # for name, op in ir.operations.items():
+        #     if op.type in quantizer.quant_operation_types:
+        #         quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
 
         QS = QuantizationSettingFactory.default_setting()
         lsq_setting = QS.lsq_optimization_setting
@@ -391,9 +395,10 @@ with torch.no_grad():
         # reports = layerwise_error_analyse(
         #     graph=ir,
         #     running_device=DEVICE,
-        #     interested_outputs=["/blocks.0/Add_output_0"],
+        #     interested_outputs=["/blocks.1/attn/MatMul_3_output_0"],
         #     dataloader=calibration_dataloader,
         #     collate_fn=collate_fn,
+        #     flatten_start_dim=0,
         # )
 
         # reports = graphwise_error_analyse_v2(
@@ -418,44 +423,94 @@ with torch.no_grad():
             running_device=DEVICE,
             collate_fn=collate_fn,
             dataloader=calibration_dataloader,
+            flatten_start_dim=0,
         )
 
-        ana_vars = []
+        ana_vars = ["/blocks.0/attn/Reshape_6_output_0"]
         for op in ir.operations.values():
-            if "0/mlp/lin1/MatMul" in op.name or "0/mlp/lin2/MatMul" in op.name:
+            if "PPQ_Operation_1" in op.name:
                 for inp in op.inputs:
                     if not inp.is_parameter:
                         ana_vars.append(inp.name)
 
-        variable_analyse(
-            ir,
-            interested_outputs=ana_vars,
-            running_device=DEVICE,
-            collate_fn=collate_fn,
-            dataloader=calibration_dataloader,
-            dequantize=True,
+        # vars = variable_analyse_get(
+        #     ir,
+        #     interested_outputs=ana_vars,
+        #     running_device=DEVICE,
+        #     collate_fn=collate_fn,
+        #     dataloader=calibration_dataloader,
+        #     dequantize=False,
+        #     steps=0,
+        # )
+        ana_vars = ["/blocks.1/attn/proj/MatMul_output_0"]
+        y_pred = torch.from_numpy(
+            variable_analyse_get(
+                ir,
+                interested_outputs=ana_vars,
+                running_device=DEVICE,
+                collate_fn=collate_fn,
+                dataloader=calibration_dataloader,
+                dequantize=False,
+                steps=0,
+            )[0]
         )
+        y_true = torch.from_numpy(
+            variable_analyse_get(
+                ir,
+                interested_outputs=ana_vars,
+                running_device=DEVICE,
+                collate_fn=collate_fn,
+                dataloader=calibration_dataloader,
+                dequantize=True,
+                steps=0,
+            )[0]
+        )
+        print(torch_snr_error(y_pred, y_true, flatten_start_dim=0))
+        torch.save((y_true), "t")
+
+        y_true = torch.load("t")
+        y_pred = x
+        from ppq import torch_snr_error
+
+        print(torch_snr_error(y_pred.cpu(), y_true, flatten_start_dim=0))
+
+        import matplotlib.pyplot as plt
+
+        import seaborn as sns
+
+        for v, name in zip(vars, ana_vars):
+            C = v.shape[-1]
+            plt.clf()
+            fig, ax = plt.subplots()
+            # ax.boxplot(v.reshape(-1, C), positions=range(1, C + 1))
+            ax.vlines(range(1, C + 1), 0, np.abs(v).reshape(-1, C).max(axis=0))
+            # sns.boxplot(np.abs(v).reshape(-1, C).max(axis=0))
+            # sns.boxplot((v).flatten())
+
+            ax.set_xlabel("Channel")
+            ax.set_ylabel("Value")
+            ax.set_title("Box Plot of range")
+            plt.savefig(f"vis/{name.replace('/','_')}.png")
 
         export_ppq_graph(
             graph=ir,
             platform=TargetPlatform.TRT_INT8,
             # platform=TargetPlatform.ONNXRUNTIME,
-            graph_save_to="Output/quantized.onnx",
+            graph_save_to="Output/quantized_3.onnx",
             config_save_to="Output/quantized.json",
             save_as_external_data=True,
             # size_threshold=1024,
         )
         from ppq.utils.TensorRTUtil import build_engine
 
-        # build_engine(
-        #     onnx_file="Output/quantized.onnx",
-        #     int8_scale_file="Output/quantized.json",
-        #     engine_file="Output/INT8.engine",
-        #     int8=True,
-        #     fp16=True,
-        #     external_data=True,
-        # )
-
+        build_engine(
+            onnx_file="Output/quantized_3.onnx",
+            int8_scale_file="Output/quantized.json",
+            engine_file="Output/INT8_3.engine",
+            int8=True,
+            fp16=True,
+            external_data=True,
+        )
         # build_engine(
         #     onnx_file="Output/quantized.onnx",
         #     engine_file="Output/FP16.engine",

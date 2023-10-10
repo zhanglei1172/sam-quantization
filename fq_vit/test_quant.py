@@ -227,6 +227,7 @@ def main():
     )
     device = torch.device(args.device)
     cfg = Config(args.ptf, args.lis, args.quant_method)
+    cfg.BIT_TYPE_A = BIT_TYPE_DICT['int8']
     model = str2model(args.model)(checkpoint=args.checkpoint, cfg=cfg)
     model = model.to(device)
 
@@ -307,6 +308,30 @@ def main():
     print("Validating...")
     val_miou1, val_miou5 = validate(args, val_loader, model, device)
 
+def infer_trt(engine, samples):
+    """Run a tensorrt model with given samples"""
+
+    results = []
+    with engine.create_execution_context() as context:
+        inputs, outputs, bindings, stream = trt_infer.allocate_buffers(context.engine)
+        for sample in samples:
+            inputs[0].host = convert_any_to_numpy(sample)
+            output = trt_infer.do_inference(
+                context,
+                bindings=bindings,
+                inputs=inputs,
+                outputs=outputs,
+                stream=stream,
+                batch_size=1,
+            )[0]
+            results.append(
+                convert_any_to_torch_tensor(output).reshape([-1, 256, 64, 64])
+            )
+    return results
+import trt_infer
+from ppq import convert_any_to_numpy, convert_any_to_torch_tensor
+from ppq.utils.TensorRTUtil import trt
+
 
 @torch.no_grad()
 def validate(args, val_loader, model, device):
@@ -317,7 +342,11 @@ def validate(args, val_loader, model, device):
 
     # switch to evaluate mode
     model.eval()
-
+    backend = "TRT"
+    logger = trt.Logger(trt.Logger.ERROR)
+    with open("Output/INT8_2.engine", "rb") as f, trt.Runtime(logger) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+        
     val_start_time = end = time.time()
     for i, batch_data in enumerate(val_loader):
         batch_data = {k: v.to(device) for k, v in batch_data.items()}
@@ -328,7 +357,13 @@ def validate(args, val_loader, model, device):
         )
         prev_masks = torch.zeros_like(gt_masks).to(device)
 
-        image_embedding = model.image_encoder(images)  # (B, 256, 64, 64
+        # image_embedding = model.image_encoder(images)  # (B, 256, 64, 64
+
+        trt_outputs = infer_trt(
+            engine,
+            samples=[convert_any_to_numpy(sample) for sample in images.cpu()],
+        )
+        image_embedding = torch.cat(trt_outputs).to(device)
 
         click_points = []
         click_labels = []
