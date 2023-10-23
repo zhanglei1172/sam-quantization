@@ -312,6 +312,44 @@ register_operation_handler(
     platform=TargetPlatform.TRT_INT8,
 )
 
+from ppq.IR import GraphFormatter, GraphMerger
+
+
+class MyFormatter(GraphFormatter):
+    def format_gemm(self):
+        format_op = [op for op in self.graph.operations.values() if op.type == "Gemm"]
+        for op in format_op:
+            if op.type == "Gemm":
+                if not op.inputs[0].is_parameter and len(op.inputs[1].shape) == 2:
+                    ori_shape = op.inputs[0].shape
+
+                    reshape = self.graph.create_operation(
+                        op_type="Reshape",
+                        name=f"{op.name}/Reshape",
+                    )
+                    var = op.inputs[0]
+                    self.graph.insert_op_before(reshape, op, op.inputs.index(var))
+                    revert_reshape = self.graph.create_operation(
+                        op_type="Reshape",
+                        name=f"{op.name}/RevertReshape",
+                    )
+                    for var in op.outputs:
+                        self.graph.insert_op_after(
+                            revert_reshape, op, op.outputs.index(var)
+                        )
+                    shape1 = self.graph.create_variable(
+                        name=None,
+                        value=convert_any_to_torch_tensor([-1, ori_shape[-1]]),
+                        is_parameter=True,
+                        dest_ops=[reshape],
+                    )
+                    shape2 = self.graph.create_variable(
+                        name=None,
+                        value=convert_any_to_torch_tensor(ori_shape[:-1] + [-1]),
+                        is_parameter=True,
+                        dest_ops=[revert_reshape],
+                    )
+
 
 register_network_quantizer(quantizer=MyTVMQuantizer, platform=TargetPlatform.EXTENSION)
 QS = QuantizationSettingFactory.default_setting()
@@ -320,15 +358,17 @@ QS.lsq_optimization = False
 with torch.no_grad():
     with ENABLE_CUDA_KERNEL():
         # QS = QuantizationSettingFactory.default_setting()
-        ir = load_onnx_graph(onnx_import_file="Output/onnx.model")
-        from ppq.IR import GraphMerger
+        ir = load_onnx_graph(onnx_import_file="out/onnx.model")
 
         processor = GraphMerger(ir)
         processor.fuse_matmul_add()
         # processor.fuse_gemm()
-        processor.fuse_layernorm()
+        # processor.fuse_layernorm()
         # processor.fuse_gelu()
-
+        executor = TorchExecutor(graph=ir)
+        executor.tracing_operation_meta(torch.zeros(size=BATCH_SHAPE).cuda())
+        formatter = MyFormatter(ir)
+        # formatter.format_gemm()
         quantizer = MyTVMQuantizer(ir)
 
         # exclued_ops = {"/patch_embed/proj/Conv"}
@@ -393,7 +433,6 @@ with torch.no_grad():
             [
                 # LayerwiseEqualizationPass(iteration=10),
                 QuantizeSimplifyPass(),
-                QuantizeFusionPass(activation_type=quantizer.activation_fusion_types),
                 ParameterQuantizePass(),
                 RuntimeCalibrationPass(),  # TODO
                 PassiveParameterQuantizePass(),
@@ -418,8 +457,7 @@ with torch.no_grad():
                 # ),
                 # PassiveParameterQuantizePass(),
                 # LearnedStepSizePass(steps=500, collecting_device='cuda', block_size=5)
-                # MyOptimPass(),
-                QuantAlignmentPass(force_overlap=True),
+                MyOptimPass(),
                 ParameterBakingPass(),
             ]
         )
@@ -464,13 +502,13 @@ with torch.no_grad():
         # #     ],
         # # )
 
-        reports = graphwise_error_analyse(
-            graph=ir,
-            running_device=DEVICE,
-            collate_fn=collate_fn,
-            dataloader=calibration_dataloader,
-            flatten_start_dim=0,
-        )
+        # reports = graphwise_error_analyse(
+        #     graph=ir,
+        #     running_device=DEVICE,
+        #     collate_fn=collate_fn,
+        #     dataloader=calibration_dataloader,
+        #     flatten_start_dim=0,
+        # )
 
         # ana_vars = ["/blocks.0/attn/Reshape_6_output_0"]
         # for op in ir.operations.values():

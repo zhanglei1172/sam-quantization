@@ -101,18 +101,6 @@ mt = "vit_h"
 model = sam_model_registry[mt](checkpoint=model_type[mt]).to(DEVICE)
 model = model.image_encoder
 
-# calibration_dataloader = []
-
-# for p in glob.glob("/data/seg/sbd/benchmark_RELEASE/dataset/img/*.jpg")[
-#     :CALIBRATION_SIZE
-# ]:
-#     img = cv2.imread(p)
-#     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-#     img = val_augmentator(image=img)["image"]
-#     img = img.transpose(2, 0, 1)
-#     img = torch.from_numpy(img).unsqueeze(0).float()
-#     calibration_dataloader.append(img)
-
 
 class MyOptimPass(QuantizationOptimizationPass):  # Fix 导出的weight无法被trt给转为int8
     def __init__(self, name: str = "My Optim Pass") -> None:
@@ -148,7 +136,7 @@ class MyOptimPass(QuantizationOptimizationPass):  # Fix 导出的weight无法被
                                     )
 
 
-class MyTVMQuantizer(TensorRTQuantizer):
+class MyTVMQuantizer(PPLCUDAQuantizer):
     def __init__(self, graph):
         super().__init__(graph)
         self._num_of_bits = 8
@@ -313,23 +301,25 @@ register_operation_handler(
 )
 
 
-register_network_quantizer(quantizer=MyTVMQuantizer, platform=TargetPlatform.EXTENSION)
+register_network_quantizer(
+    quantizer=PPLCUDAQuantizer, platform=TargetPlatform.EXTENSION
+)
 QS = QuantizationSettingFactory.default_setting()
 QS.lsq_optimization = False
 
 with torch.no_grad():
     with ENABLE_CUDA_KERNEL():
         # QS = QuantizationSettingFactory.default_setting()
-        ir = load_onnx_graph(onnx_import_file="Output/onnx.model")
+        ir = load_onnx_graph(onnx_import_file="out_/onnx_.model")
         from ppq.IR import GraphMerger
 
         processor = GraphMerger(ir)
-        processor.fuse_matmul_add()
-        # processor.fuse_gemm()
-        processor.fuse_layernorm()
+        # processor.fuse_matmul_add()
+        processor.fuse_gemm()
+        # processor.fuse_layernorm()
         # processor.fuse_gelu()
 
-        quantizer = MyTVMQuantizer(ir)
+        quantizer = PPLCUDAQuantizer(ir)
 
         # exclued_ops = {"/patch_embed/proj/Conv"}
         exclued_ops = set()
@@ -363,6 +353,7 @@ with torch.no_grad():
         #         if not inp.is_parameter:
         #             exclude_inps.add(inp.name)
         exclude_inps = set()
+        dispatching_table = DispatchingTable()
         for name, op in ir.operations.items():
             if (
                 op.type
@@ -380,15 +371,33 @@ with torch.no_grad():
             ):
                 # if name not in exclued_ops and "mlp" in name and "lin2" in name:
                 # if "attn/MatMul_1" not in name and "attn/MatMul_2" not in name:
-                quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
+                # quantizer.quantize_operation(name, platform=TargetPlatform.PPL_CUDA_INT8)
+
+                dispatching_table.append(name, TargetPlatform.PPL_CUDA_INT8)
+
         # for name, op in ir.operations.items():
         #     if op.type in quantizer.quant_operation_types:
         #         quantizer.quantize_operation(name, platform=TargetPlatform.INT8)
 
-        QS = QuantizationSettingFactory.default_setting()
-        lsq_setting = QS.lsq_optimization_setting
-        blockwise_reconstruction_setting = QS.blockwise_reconstruction_setting
+        # QS = QuantizationSettingFactory.default_setting()
+        # lsq_setting = QS.lsq_optimization_setting
+        # blockwise_reconstruction_setting = QS.blockwise_reconstruction_setting
         # build quant pipeline.
+        ppq_ir = dispatch_graph(
+            graph=ir,
+            platform=TargetPlatform.PPL_CUDA_INT8,
+            dispatcher="conservative",
+            dispatching_table=dispatching_table,
+        )
+        for op_name, operation in ir.operations.items():
+            if operation.platform == TargetPlatform.UNSPECIFIED:
+                if operation.type in quantizer.quant_operation_types:
+                    operation.platform = quantizer.target_platform
+                else:
+                    operation.platform = TargetPlatform.FP32
+
+            if operation.platform not in {TargetPlatform.FP32, TargetPlatform.SOI}:
+                quantizer.quantize_operation(op_name)
         pipeline = PFL.Pipeline(
             [
                 # LayerwiseEqualizationPass(iteration=10),
@@ -397,28 +406,6 @@ with torch.no_grad():
                 ParameterQuantizePass(),
                 RuntimeCalibrationPass(),  # TODO
                 PassiveParameterQuantizePass(),
-                # LearnedStepSizePass(
-                #     interested_layers=lsq_setting.interested_layers,
-                #     lr=lsq_setting.lr,
-                #     collecting_device=lsq_setting.collecting_device,
-                #     steps=lsq_setting.steps,
-                #     gamma=lsq_setting.gamma,
-                #     is_scale_trainable=lsq_setting.is_scale_trainable,
-                #     block_size=lsq_setting.block_size,
-                # ),
-                # PassiveParameterQuantizePass(),
-                # AdaroundPass(
-                #     interested_layers=blockwise_reconstruction_setting.interested_layers,
-                #     lr=blockwise_reconstruction_setting.lr,
-                #     collecting_device=blockwise_reconstruction_setting.collecting_device,
-                #     steps=blockwise_reconstruction_setting.steps,
-                #     gamma=blockwise_reconstruction_setting.gamma,
-                #     is_scale_trainable=blockwise_reconstruction_setting.is_scale_trainable,
-                #     block_size=blockwise_reconstruction_setting.block_size,
-                # ),
-                # PassiveParameterQuantizePass(),
-                # LearnedStepSizePass(steps=500, collecting_device='cuda', block_size=5)
-                # MyOptimPass(),
                 QuantAlignmentPass(force_overlap=True),
                 ParameterBakingPass(),
             ]
@@ -446,24 +433,6 @@ with torch.no_grad():
         # #     flatten_start_dim=0,
         # # )
 
-        # # reports = graphwise_error_analyse_v2(
-        # #     graph=ir,
-        # #     running_device=DEVICE,
-        # #     collate_fn=collate_fn,
-        # #     dataloader=calibration_dataloader,
-        # #     interested_op=[
-        # #         "/blocks.0/attn/MatMul_3",
-        # #         "/blocks.0/attn/MatMul_2",
-        # #         "/blocks.0/attn/MatMul_1",
-        # #         "/blocks.0/attn/MatMul",
-        # #         "/blocks.0/attn/proj/MatMul",
-        # #         "/blocks.0/mlp/lin1/MatMul",
-        # #         "/blocks.0/mlp/lin2/MatMul",
-        # #         "/blocks.1/attn/qkv/MatMul",
-        # #         "/neck/neck.2/Conv",
-        # #     ],
-        # # )
-
         reports = graphwise_error_analyse(
             graph=ir,
             running_device=DEVICE,
@@ -472,87 +441,22 @@ with torch.no_grad():
             flatten_start_dim=0,
         )
 
-        # ana_vars = ["/blocks.0/attn/Reshape_6_output_0"]
-        # for op in ir.operations.values():
-        #     if "PPQ_Operation_1" in op.name:
-        #         for inp in op.inputs:
-        #             if not inp.is_parameter:
-        #                 ana_vars.append(inp.name)
-
-        # # vars = variable_analyse_get(
-        # #     ir,
-        # #     interested_outputs=ana_vars,
-        # #     running_device=DEVICE,
-        # #     collate_fn=collate_fn,
-        # #     dataloader=calibration_dataloader,
-        # #     dequantize=False,
-        # #     steps=0,
-        # # )
-        # ana_vars = ["/blocks.1/attn/proj/MatMul_output_0"]
-        # y_pred = torch.from_numpy(
-        #     variable_analyse_get(
-        #         ir,
-        #         interested_outputs=ana_vars,
-        #         running_device=DEVICE,
-        #         collate_fn=collate_fn,
-        #         dataloader=calibration_dataloader,
-        #         dequantize=False,
-        #         steps=0,
-        #     )[0]
-        # )
-        # y_true = torch.from_numpy(
-        #     variable_analyse_get(
-        #         ir,
-        #         interested_outputs=ana_vars,
-        #         running_device=DEVICE,
-        #         collate_fn=collate_fn,
-        #         dataloader=calibration_dataloader,
-        #         dequantize=True,
-        #         steps=0,
-        #     )[0]
-        # )
-        # print(torch_snr_error(y_pred, y_true, flatten_start_dim=0))
-        # torch.save((y_true), "t")
-
-        # y_true = torch.load("t")
-        # y_pred = x
-        # from ppq import torch_snr_error
-
-        # print(torch_snr_error(y_pred.cpu(), y_true, flatten_start_dim=0))
-
-        # import matplotlib.pyplot as plt
-
-        # import seaborn as sns
-
-        # for v, name in zip(vars, ana_vars):
-        #     C = v.shape[-1]
-        #     plt.clf()
-        #     fig, ax = plt.subplots()
-        #     # ax.boxplot(v.reshape(-1, C), positions=range(1, C + 1))
-        #     ax.vlines(range(1, C + 1), 0, np.abs(v).reshape(-1, C).max(axis=0))
-        #     # sns.boxplot(np.abs(v).reshape(-1, C).max(axis=0))
-        #     # sns.boxplot((v).flatten())
-
-        #     ax.set_xlabel("Channel")
-        #     ax.set_ylabel("Value")
-        #     ax.set_title("Box Plot of range")
-        #     plt.savefig(f"vis/{name.replace('/','_')}.png")
-
         export_ppq_graph(
             graph=ir,
             # platform=TargetPlatform.TRT_INT8,
-            platform=TargetPlatform.ONNXRUNTIME,
-            graph_save_to="Output/quantized.onnx",
-            config_save_to="Output/quantized.json",
+            platform=TargetPlatform.PPL_CUDA_INT8,
+            # platform=TargetPlatform.ONNXRUNTIME,
+            graph_save_to="out_q/quantized.onnx",
+            config_save_to="out_q/quantized.json",
             save_as_external_data=True,
             size_threshold=1024,
         )
         from ppq.utils.TensorRTUtil import build_engine
 
         build_engine(
-            onnx_file="Output/quantized.onnx",
-            int8_scale_file="Output/quantized.json",
-            engine_file="Output/INT8.engine",
+            onnx_file="out_q/quantized.onnx",
+            int8_scale_file="out_q/quantized.json",
+            engine_file="trt_out/INT8.engine",
             int8=True,
             fp16=True,
             external_data=True,

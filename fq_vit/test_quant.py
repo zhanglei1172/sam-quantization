@@ -344,7 +344,7 @@ def validate(args, val_loader, model, device):
     model.eval()
     backend = "TRT"
     logger = trt.Logger(trt.Logger.ERROR)
-    with open("Output/INT8_2.engine", "rb") as f, trt.Runtime(logger) as runtime:
+    with open("Output/INT8.engine", "rb") as f, trt.Runtime(logger) as runtime:
         engine = runtime.deserialize_cuda_engine(f.read())
         
     val_start_time = end = time.time()

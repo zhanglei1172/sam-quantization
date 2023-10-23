@@ -441,17 +441,18 @@ QS = QuantizationSettingFactory.default_setting()
 QS.lsq_optimization = False
 
 with torch.no_grad():
-    # torch.onnx.export(
-    #     model,
-    #     torch.rand(size=[1] + INPUT_SHAPE).to(DEVICE),
-    #     "out/onnx.model",
-    #     export_params=True,
-    #     verbose=False,
-    #     opset_version=11,
-    #     do_constant_folding=True,
-    #     # input_names=list(dummy_inputs.keys()),
-    #     output_names=output_names,
-    # )
+    torch.onnx.export(
+        model,
+        torch.rand(size=[1] + INPUT_SHAPE).to(DEVICE),
+        "out_/onnx_.model",
+        export_params=True,
+        verbose=False,
+        opset_version=11,
+        do_constant_folding=True,
+        # input_names=list(dummy_inputs.keys()),
+        output_names=output_names,
+    )
+    sys.exit()
     # onnx_model = onnx.load("out/onnx.model")
     # model_simp, check = simplify(onnx_model)  # 对onnx模型进行简化，消除冗余算子
     # assert check, "Simplified ONNX model could not be validated"
