@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from segment_anything.modeling.image_encoder import Attention, add_decomposed_rel_pos
+from segment_anything.modeling.image_encoder import Attention, get_rel_pos
 
 import math
 from typing import Optional, Tuple
@@ -43,6 +43,43 @@ def make_quant_attn(model):
         setattr(parent, child_name, attn)
 
 
+def add_decomposed_rel_pos(
+    q: torch.Tensor,
+    rel_pos_h: torch.Tensor,
+    rel_pos_w: torch.Tensor,
+    q_size: Tuple[int, int],
+    k_size: Tuple[int, int],
+) -> torch.Tensor:
+    """
+    Calculate decomposed Relative Positional Embeddings from :paper:`mvitv2`.
+    https://github.com/facebookresearch/mvit/blob/19786631e330df9f3622e5402b4a419a263a2c80/mvit/models/attention.py   # noqa B950
+    Args:
+        attn (Tensor): attention map.
+        q (Tensor): query q in the attention layer with shape (B, q_h * q_w, C).
+        rel_pos_h (Tensor): relative position embeddings (Lh, C) for height axis.
+        rel_pos_w (Tensor): relative position embeddings (Lw, C) for width axis.
+        q_size (Tuple): spatial sequence size of query q with (q_h, q_w).
+        k_size (Tuple): spatial sequence size of key k with (k_h, k_w).
+
+    Returns:
+        attn (Tensor): attention map with added relative positional embeddings.
+    """
+    q_h, q_w = q_size
+    k_h, k_w = k_size
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+
+    B, _, dim = q.shape
+    r_q = q.reshape(B, q_h, q_w, dim)
+    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    # or not use torch.einsum:
+    rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
+    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
+
+    return rel_h, rel_w
+
+
 class QuantAttention(nn.Module):
     """
     Modified version of LlamaAttention that fuses the q, k, v projections.
@@ -80,25 +117,35 @@ class QuantAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        q, k, v = qkv.reshape(3, B * self.num_heads, H, W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        # attn = (q * self.scale) @ k.transpose(-2, -1)
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(
-                attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+            rel_h, rel_w = add_decomposed_rel_pos(
+                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
+            x = forward(
+                x,
+                rel_h,
+                rel_w,
+                self.num_heads,
+                x.shape[-1],
+                sm_scale=self.scale,
+            ).to(x.dtype)
+        else:
+            raise NotImplementedError
 
         # upcast attention to fp32
-        attn = nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(qkv.dtype)
+        # attn = nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(qkv.dtype)
 
         # Get output
-        x = (
-            (attn @ v)
-            .view(B, self.num_heads, H, W, -1)
-            .permute(0, 2, 3, 1, 4)
-            .reshape(B, H, W, -1)
-        )
+        # x = (
+        #     (attn @ v)
+        #     .view(B, self.num_heads, H, W, -1)
+        #     .permute(0, 2, 3, 1, 4)
+        #     .reshape(B, H, W, -1)
+        # )
         out = self.o_proj(x)
 
         return out
@@ -145,21 +192,21 @@ def _fwd_kernel1(
         + start_m * seq_stride
         + head_idx * head_stride
         + batch_idx * batch_stride
-        + (tl.expand_dims(offs_m, 1) * seq_stride + tl.expand_dims(offs_hidden,0))
+        + (offs_m[:, None] * seq_stride + offs_hidden[None, :])
     )
     k_ptrs = (
         INP
         + head_idx * head_stride
         + batch_idx * batch_stride
         + qkv_offset
-        + (tl.expand_dims(offs_n, 1) * seq_stride + tl.expand_dims(offs_hidden,0))
+        + (offs_n[:, None] * seq_stride + offs_hidden[None, :])
     )
     v_ptrs = (
         INP
         + head_idx * head_stride
         + batch_idx * batch_stride
         + qkv_offset * 2
-        + (tl.expand_dims(offs_n, 1) * seq_stride + tl.expand_dims(offs_hidden,0))
+        + (offs_n[:, None] * seq_stride + offs_hidden[None, :])
     )
 
     # initialize pointer to m and l
@@ -171,12 +218,12 @@ def _fwd_kernel1(
     # scale sm_scale by 1/log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
-    qk_scale = sm_scale #* 1.44269504
+    qk_scale = sm_scale * 1.44269504
     # load q: it will stay in SRAM throughout
     q = tl.load(
         q_ptrs,
-        mask=(tl.expand_dims(offs_hidden, 0) < hidden_dim)
-        & (tl.expand_dims(offs_m, 1) < seq_len - start_m),
+        mask=(offs_hidden[None, :] < hidden_dim)
+        & (offs_m[:, None] < seq_len - start_m),
         other=0.0,
     )
     q = (q * qk_scale).to(INP.dtype.element_ty)
@@ -186,20 +233,25 @@ def _fwd_kernel1(
     for start_n in range(0, seq_len, BLOCK_N):
         _offs_emb1 = (offs_n + start_n) // emb_len
         _offs_emb2 = (offs_n + start_n) % emb_len
-        b1_ptrs = b_ptrs1_ + (tl.expand_dims(offs_m, 1) * emb_len + tl.expand_dims(_offs_emb1, 0))
-        b2_ptrs = b_ptrs2_ + (tl.expand_dims(offs_m, 1) * emb_len + tl.expand_dims(_offs_emb2, 0))
-        # start_n = tl.multiple_of(start_n, BLOCK_N)
+        b1_ptrs = b_ptrs1_ + (
+            (offs_m + start_m)[:, None] * emb_len + (_offs_emb1)[None, :]
+        )
+        b2_ptrs = b_ptrs2_ + (
+            (offs_m + start_m)[:, None] * emb_len + (_offs_emb2)[None, :]
+        )
+
+        start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- load k, v --
         k = tl.load(
             k_ptrs + start_n * seq_stride,
-            mask=(tl.expand_dims(offs_hidden, 0) < hidden_dim)
-            & (tl.expand_dims(offs_n, 1) < seq_len - start_n),
+            mask=(offs_hidden[None, :] < hidden_dim)
+            & (offs_n[:, None] < seq_len - start_n),
             other=0,
         )
         v = tl.load(
             v_ptrs + start_n * seq_stride,
-            mask=(tl.expand_dims(offs_hidden, 0) < hidden_dim)
-            & (tl.expand_dims(offs_n, 1) < seq_len - start_n),
+            mask=(offs_hidden[None, :] < hidden_dim)
+            & (offs_n[:, None] < seq_len - start_n),
             other=0,
         )
         # -- compute qk ---
@@ -208,53 +260,53 @@ def _fwd_kernel1(
 
         b1 = tl.load(
             b1_ptrs,
-            mask=((tl.expand_dims(offs_m, 1) < seq_len - start_m))
-            & ((tl.expand_dims(offs_n, 1) < seq_len - start_n)),
+            mask=((offs_m[:, None] < seq_len - start_m))
+            & ((offs_n[None, :] < seq_len - start_n)),
             other=0.0,
         ).to(
             tl.float32
         )  # [:, :, None]
         b2 = tl.load(
             b2_ptrs,
-            mask=((tl.expand_dims(offs_m, 1) < seq_len - start_m))
-            & ((tl.expand_dims(offs_n, 1) < seq_len - start_n)),
+            mask=((offs_m[:, None] < seq_len - start_m))
+            & ((offs_n[None, :] < seq_len - start_n)),
             other=0.0,
         ).to(
             tl.float32
         )  # [:, None, :]
-        qk += b1 #* 1.44269504
-        qk += b2 #* 1.44269504
+        qk += (b1 + b2) * 1.44269504
+        # qk += b2 #* 1.44269504
         qk = tl.where(
-            (seq_len - start_n > tl.expand_dims(offs_n, 0))
-            & (seq_len - start_m > tl.expand_dims(offs_n, 1)),
+            (seq_len - start_n > offs_n[None, :])
+            & (seq_len - start_m > offs_m[:, None]),
             qk,
             float("-inf"),
         )
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - tl.expand_dims(m_i_new, 1))
+        alpha = tl.math.exp2(m_i - m_i_new)
+        p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-        acc *= tl.expand_dims(acc_scale, 1)
+        acc *= acc_scale[:, None]
         acc += tl.dot(p.to(INP.dtype.element_ty), v, allow_tf32=True)
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
     # write back l and m
-    acc = acc / tl.expand_dims(l_i, 1)
+    acc = acc / l_i[:, None]
     # write back O
     O_ptrs = (
         Out
         + start_m * seq_stride // 3
         + head_idx * head_stride
         + batch_idx * batch_stride // 3
-        + (offs_m[:, None] * (seq_stride // 3) + tl.expand_dims(offs_hidden, 0))
+        + (offs_m[:, None] * (seq_stride // 3) + offs_hidden[None, :])
     )
     tl.store(
         O_ptrs,
         acc.to(Out.dtype.element_ty),
-        mask=(tl.expand_dims(offs_hidden, 0) < hidden_dim)
+        mask=(offs_hidden[None, :] < hidden_dim)
         & (offs_m[:, None] < seq_len - start_m),
     )
 
@@ -364,5 +416,5 @@ def test_op(batch, h, w, qkvhd, head_num=8, dtype=torch.float16):
 
 
 if __name__ == "__main__":
-    test_op(25, 14, 14, 3 * 16 * 80, head_num=16, dtype=torch.float16)
-    test_op(1, 64, 64, 3 * 16 * 80, head_num=16, dtype=torch.float16)
+    test_op(25, 14, 14, 3 * 16 * 80, head_num=16, dtype=torch.bfloat16)
+    test_op(1, 64, 64, 3 * 16 * 80, head_num=16, dtype=torch.bfloat16)
