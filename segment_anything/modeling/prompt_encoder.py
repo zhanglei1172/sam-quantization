@@ -78,9 +78,10 @@ class PromptEncoder(nn.Module):
     ) -> torch.Tensor:
         """Embeds point prompts."""
         points = points + 0.5  # Shift to center of pixel
+        dtype = points.dtype
         if pad:
-            padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device)
-            padding_label = -torch.ones((labels.shape[0], 1), device=labels.device)
+            padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device, dtype=dtype)
+            padding_label = -torch.ones((labels.shape[0], 1), device=labels.device, dtype=dtype)
             points = torch.cat([points, padding_point], dim=1)
             labels = torch.cat([labels, padding_label], dim=1)
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)
@@ -161,7 +162,7 @@ class PromptEncoder(nn.Module):
         if masks is not None:
             dense_embeddings = self._embed_masks(masks)
         else:
-            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            dense_embeddings = self.no_mask_embed.weight.to(sparse_embeddings.dtype).reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
 
@@ -186,7 +187,7 @@ class PositionEmbeddingRandom(nn.Module):
         """Positionally encode points that are normalized to [0,1]."""
         # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
         coords = 2 * coords - 1
-        coords = coords @ self.positional_encoding_gaussian_matrix
+        coords = coords @ self.positional_encoding_gaussian_matrix.float()
         coords = 2 * np.pi * coords
         # outputs d_1 x ... x d_n x C shape
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
@@ -201,7 +202,7 @@ class PositionEmbeddingRandom(nn.Module):
         y_embed = y_embed / h
         x_embed = x_embed / w
 
-        pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
+        pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1)).to(self.positional_encoding_gaussian_matrix.dtype)
         return pe.permute(2, 0, 1)  # C x H x W
 
     def forward_with_coords(
@@ -211,4 +212,4 @@ class PositionEmbeddingRandom(nn.Module):
         coords = coords_input.clone()
         coords[:, :, 0] = coords[:, :, 0] / image_size[1]
         coords[:, :, 1] = coords[:, :, 1] / image_size[0]
-        return self._pe_encoding(coords.to(torch.float))  # B x N x C
+        return self._pe_encoding(coords.to(torch.float)).to(coords_input.dtype)  # B x N x C

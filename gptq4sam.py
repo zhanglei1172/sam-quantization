@@ -2,6 +2,8 @@ import numpy as np
 import torch
 
 import random
+from pathlib import Path
+from tqdm import tqdm
 
 seed = 0
 # def set_seed(seed):
@@ -15,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from segment_anything.build_sam import sam_model_registry
 
-import monai
+# import monai
 import requests
 import time
 from albumentations import *
@@ -23,8 +25,10 @@ from data.datasets.sbd import SBDDataset
 from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from gptq import *
+from gptq_triton import QuantLinear, quant_linear
 from PIL import Image
-from quant import *
+
+# from quant import *
 from script.evaluation2 import get_next_click_torch, main
 from transformers import SamModel, SamProcessor
 from typing import Optional
@@ -131,7 +135,9 @@ def quantize_prompt_encoder(model, dev, points=None, boxes=None, masks=None):
         sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
     if masks is not None:
-        layer, inps, dense_embeddings = quantize_layer(layer.mask_downscaling, masks, len(masks), dev)
+        layer, inps, dense_embeddings = quantize_layer(
+            layer.mask_downscaling, masks, len(masks), dev
+        )
         dense_embeddings = torch.cat(dense_embeddings, dim=0)
     else:
         dense_embeddings = model.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
@@ -270,6 +276,227 @@ def quantize_model(model, data, dev):
     torch.save(model.state_dict(), f"./checkpoints/sam-{args.wbits}.pt")
 
 
+@torch.no_grad()
+def sam_sequential(
+    model,
+    dataloader,
+    device,
+    wbits: int,
+    nsamples: int,
+    true_sequential: bool,
+    sym: bool,
+    percdamp: float,
+    groupsize: int,
+    act_order: bool,
+    name_prefix=""
+):
+    # Prepare
+    layers = model.blocks
+    dtype = next(iter(model.parameters())).dtype
+    inps = [None] * nsamples
+    outs = [None] * nsamples
+    # outs = torch.zeros_like(inps)
+
+    # Move the first layer to GPU
+    model.patch_embed = model.patch_embed.to(device)
+    if model.pos_embed is not None:
+        # parameta asign
+        model.pos_embed.data = model.pos_embed.data.to(device)
+    layers[0] = layers[0].to(device)
+
+    # Create a dummy layer that catches the input and attention mask, and then bails
+    # This allows us to capture all the inputs to the first layer for the calibration data
+    cache = {"i": 0}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache["i"]] = inp
+            cache["i"] += 1
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for i, batch in enumerate(dataloader):
+        if i == nsamples:
+            break
+        try:
+            model(batch["images"].to(dtype).to(device))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+
+    # Move things back to the CPU (but not the first layer, since we'll just move it back to GPU immediately below)
+    model.patch_embed = model.patch_embed.cpu()
+    if model.pos_embed is not None:
+        model.pos_embed.data = model.pos_embed.data.cpu()
+    torch.cuda.empty_cache()
+
+    quantizers = {}
+
+    # Layers are quantized in order, and only one layer lives on the GPU at a time to save memory
+    # Otherwise quantizing large models would be impossible (NOTE for future readers: are you enjoying your 1TB VRAM?)
+    for i, layer in tqdm(enumerate(layers), total=len(layers)):
+        layer = layer.to(device)
+        full = {
+            name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)
+        }
+
+        if true_sequential:
+            sequential = [
+                ["attn.qkv"],
+                ["attn.proj"],
+                ["mlp.lin1", "mlp.lin2"],
+            ]
+        else:
+            sequential = [list(full.keys())]
+
+        # For each subset of linear layers
+        for names in sequential:
+            subset = {n: full[n] for n in names}
+            gptq = {}
+
+            # Prepare a quantizer for each linear layer
+            for name in subset:
+                gptq[name] = GPTQ(subset[name])
+                gptq[name].quantizer = Quantizer()
+                gptq[name].quantizer.configure(
+                    wbits, perchannel=True, sym=sym, mse=False
+                )
+
+            # Feed data to the quantizer, and save outs
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+
+                return tmp
+
+            handles = []
+            for name in subset:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            for j in range(nsamples):
+                outs[j] = layer(
+                    inps[j],
+                )
+            for h in handles:
+                h.remove()
+
+            # With the data collected, quantize the layers
+            for name in subset:
+                print(i, name)
+                scale, zero = gptq[name].fasterquant(
+                    percdamp=percdamp, groupsize=groupsize, actorder=act_order
+                )
+                quantizers[name_prefix+"blocks.%d.%s" % (i, name)] = (
+                    gptq[name].quantizer,
+                    scale,
+                    zero,
+                )
+                gptq[name].free()
+
+        # Save outputs of the layer after quantization, so we can feed them into the next layer
+        for j in range(nsamples):
+            outs[j] = layer(
+                inps[j],
+            )
+
+        # Move the layer back to the CPU, and free up memory
+        layers[i] = layer.cpu()
+        del layer
+        del gptq
+        torch.cuda.empty_cache()
+
+        # Swap buffers
+        inps, outs = outs, inps
+
+    return quantizers
+
+
+def sam_pack(model, quantizers, wbits: int, groupsize: int):
+    # Find all the quantized layers
+    layers = {name: m for name, m in model.named_modules() if isinstance(m, nn.Linear)}
+    layers = {n: layers[n] for n in quantizers}
+
+    # Replace all applicable instances of Linear with QuantLinear in the model
+    quant_linear.make_quant(model, wbits, groupsize)
+
+    for name, m in tqdm(model.named_modules(), total=len(list(model.named_modules()))):
+        if not isinstance(m, QuantLinear):
+            continue
+
+        quantizer, scale, zero = quantizers[name]
+        quantizer, scale, zero = quantizer.cpu(), scale.cpu(), zero.cpu()
+        pack_linear(m, layers[name].weight.data, scale, zero, layers[name].bias.data)
+
+
+def pack_linear(
+    quant,
+    weights: torch.FloatTensor,
+    scales: torch.FloatTensor,
+    zeros,
+    bias: Optional[torch.FloatTensor],
+):
+    """
+    Packs the quantized weights, scales, and zero points into a QuantLinear layer
+    """
+    scales = scales.t().contiguous()
+    zeros = zeros.t().contiguous()
+    scale_zeros = zeros * scales
+
+    quant.scales = scales.clone().to(torch.float16)
+
+    if quant.bias is not None:
+        quant.bias = bias.clone().to(torch.float16)
+
+    # Round weights to nearest integer based on scale and zero point
+    # Each weight will be one int, but should not exceed quant.bits
+    intweight = []
+    for idx in range(quant.infeatures):
+        g_idx = idx // quant.groupsize
+        # TODO: This is oddly complex.  The `gptq.quantize` function does `return scale * (q - zero)`, so shouldn't
+        # this just be `q = torch.round((weights[:,idx] / scales[g_idx]) + zero[g_idx])`?
+        q = torch.round((weights[:, idx] + scale_zeros[g_idx]) / scales[g_idx]).to(
+            torch.int32
+        )
+        intweight.append(q[:, None])
+    intweight = torch.cat(intweight, dim=1)
+    intweight = intweight.t().contiguous()
+
+    # Now pack the weights into uint32's
+    # qweight = torch.zeros((intweight.shape[0] // 32 * quant.bits, intweight.shape[1]), dtype=torch.int32)
+    quant.qweight.zero_()
+    i = 0
+    row = 0
+    while row < quant.qweight.shape[0]:
+        if quant.bits in [2, 4, 8]:
+            for j in range(i, i + (32 // quant.bits)):
+                quant.qweight[row] |= intweight[j] << (quant.bits * (j - i))
+            i += 32 // quant.bits
+            row += 1
+        else:
+            raise NotImplementedError("Only 2,4,8 bits are supported.")
+
+    # Subtract 1 from the zero point
+    zeros = zeros - 1
+
+    # Pack the zero points into uint32's
+    zeros = zeros.to(torch.int32)
+    # qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // 256 * (self.bits * 8)), dtype=np.uint32)
+    quant.qzeros.zero_()
+    i = 0
+    col = 0
+    while col < quant.qzeros.shape[1]:
+        if quant.bits in [2, 4, 8]:
+            for j in range(i, i + (32 // quant.bits)):
+                quant.qzeros[:, col] |= zeros[:, j] << (quant.bits * (j - i))
+            i += 32 // quant.bits
+            col += 1
+        else:
+            raise NotImplementedError("Only 2,4,8 bits are supported.")
+
+
 if __name__ == "__main__":
     import argparse
     from utils.datautils import *
@@ -352,6 +579,9 @@ if __name__ == "__main__":
         "--num_workers",
         action="store_true",
     )
+    parser.add_argument(
+        "--save",
+    )
 
     args = parser.parse_args()
     assert args.batch_size == 1, "Batch size must be 1 for calibration."
@@ -364,7 +594,7 @@ if __name__ == "__main__":
     device = "cuda"
     mt = "vit_h"
     model = sam_model_registry[mt](checkpoint=model_type[mt])
-    
+
     # model = get_llama(args.model)
     model.eval()
 
@@ -402,7 +632,34 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
     )
 
+    model.half()
     # eval_origin(model, testloader, DEV)
-    quantize_model(model, train_data, DEV)
+    # quantize_model(model, train_data, DEV)
+    quantizers = sam_sequential(
+        model.image_encoder,
+        train_data,
+        DEV,
+        args.wbits,
+        args.nsamples,
+        args.true_sequential,
+        args.sym,
+        args.percdamp,
+        args.groupsize,
+        args.act_order,
+        name_prefix=""
+    )
+    args.save = Path(args.save)
+    args.save.mkdir(parents=True, exist_ok=True)
+    sam_pack(model.image_encoder, quantizers, args.wbits, args.groupsize)
+    torch.save(model.state_dict(), args.save / "model.pt")
+    with open(args.save / "quant_config.json", "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "wbits": args.wbits,
+                    "groupsize": args.groupsize,
+                }
+            )
+        )
     # model.load_state_dict(torch.load(f"./checkpoints/sam-{args.wbits}.pt"))
     main(model.to(DEV), val_data, args, device)

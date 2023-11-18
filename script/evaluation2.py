@@ -10,15 +10,24 @@ from torchvision.transforms import ToPILImage
 from segment_anything.build_sam import sam_model_registry
 
 import pandas as pd
-import tensorrt as trt
-import trt_infer
+
+try:
+    import tensorrt as trt
+    import trt_infer
+except:
+    pass
+
 from albumentations import *
 from data.datasets.sbd import SBDDataset
 from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from PIL import ImageDraw
-from ppq import convert_any_to_numpy, convert_any_to_torch_tensor
-from ppq.utils.TensorRTUtil import trt
+
+try:
+    from ppq import convert_any_to_numpy, convert_any_to_torch_tensor
+    from ppq.utils.TensorRTUtil import trt
+except:
+    pass
 from typing import List
 
 # crop_size = (1024, 1024)
@@ -215,6 +224,7 @@ def infer_trt(engine, samples: List[np.ndarray]) -> List[np.ndarray]:
 
 @torch.no_grad()
 def main(sam_model, val_data, args, device):
+    dtype = next(sam_model.parameters()).dtype
     all_iou = 0
     iou_list = []
     backend = None
@@ -235,9 +245,9 @@ def main(sam_model, val_data, args, device):
     for step, batch_data in enumerate(val_data):
         batch_data = {k: v.to(device) for k, v in batch_data.items()}
         images, gt_masks, points = (
-            batch_data["images"],
-            batch_data["instances"],
-            batch_data["points"],
+            batch_data["images"].to(dtype),
+            batch_data["instances"].to(dtype),
+            batch_data["points"].to(dtype),
         )
         prev_masks = torch.zeros_like(gt_masks).to(device)
 
@@ -266,8 +276,8 @@ def main(sam_model, val_data, args, device):
         for num_click in range(5):
             batch_points, batch_labels = get_next_click_torch(prev_masks, gt_masks)
 
-            points_co = torch.cat(batch_points, dim=0).to(device)
-            points_la = torch.cat(batch_labels, dim=0).to(device)
+            points_co = torch.cat(batch_points, dim=0).to(device).to(dtype)
+            points_la = torch.cat(batch_labels, dim=0).to(device).to(dtype)
 
             click_points.append(points_co)
             click_labels.append(points_la)
@@ -296,7 +306,7 @@ def main(sam_model, val_data, args, device):
             )
             low_res_masks, iou_predictions = sam_model.mask_decoder(
                 image_embeddings=image_embedding.to(device),  # (B, 256, 64, 64)
-                image_pe=sam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+                image_pe=sam_model.prompt_encoder.get_dense_pe().to(dtype),  # (1, 256, 64, 64)
                 sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
                 dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
                 multimask_output=False,
@@ -326,48 +336,48 @@ def main(sam_model, val_data, args, device):
 
         # print(batch_data['instances'].unique())
         # print(batch_data)
-        img = ToPILImage()(batch_data["images"][0])
-        mask = ToPILImage()(batch_data["instances"][0])
-        img.save(f"saved_imgs/{step}_img.png")
-        mask.save(f"saved_imgs/{step}_mask.png")
-        pred_mask = ToPILImage()(pred_masks[0])
-        pred_mask.save(f"saved_imgs/{step}_pred_mask.png")
+    #     img = ToPILImage()(batch_data["images"][0])
+    #     mask = ToPILImage()(batch_data["instances"][0])
+    #     img.save(f"saved_imgs/{step}_img.png")
+    #     mask.save(f"saved_imgs/{step}_mask.png")
+    #     pred_mask = ToPILImage()(pred_masks[0])
+    #     pred_mask.save(f"saved_imgs/{step}_pred_mask.png")
 
-        imagedraw = ImageDraw.Draw(img)
+    #     imagedraw = ImageDraw.Draw(img)
 
-        for index in range(len(coords_torch[0])):
-            # print(coords_torch)
-            # print(coords_torch[0][0])
-            if labels_torch[0][index] == 0:
-                imagedraw.point(
-                    (coords_torch[0][index][0], coords_torch[0][index][1]), (255, 0, 0)
-                )
-                imagedraw.ellipse(
-                    (
-                        coords_torch[0][index][0] - 3,
-                        coords_torch[0][index][1] - 3,
-                        coords_torch[0][index][0] + 3,
-                        coords_torch[0][index][1] + 3,
-                    ),
-                    fill=(255, 0, 0),
-                )
-            else:
-                imagedraw.ellipse(
-                    (
-                        coords_torch[0][index][0] - 3,
-                        coords_torch[0][index][1] - 3,
-                        coords_torch[0][index][0] + 3,
-                        coords_torch[0][index][1] + 3,
-                    ),
-                    fill=(0, 0, 255),
-                )
-                imagedraw.point(
-                    (coords_torch[0][index][0], coords_torch[0][index][1]), (0, 255, 0)
-                )
-        img.save(f"saved_imgs/{step}_points.png")
-    pd.DataFrame(iou_list).to_csv(
-        f"saved_csvs/{args.model_path.split('/')[-1].split('.')[0]}.csv"
-    )
+    #     for index in range(len(coords_torch[0])):
+    #         # print(coords_torch)
+    #         # print(coords_torch[0][0])
+    #         if labels_torch[0][index] == 0:
+    #             imagedraw.point(
+    #                 (coords_torch[0][index][0], coords_torch[0][index][1]), (255, 0, 0)
+    #             )
+    #             imagedraw.ellipse(
+    #                 (
+    #                     coords_torch[0][index][0] - 3,
+    #                     coords_torch[0][index][1] - 3,
+    #                     coords_torch[0][index][0] + 3,
+    #                     coords_torch[0][index][1] + 3,
+    #                 ),
+    #                 fill=(255, 0, 0),
+    #             )
+    #         else:
+    #             imagedraw.ellipse(
+    #                 (
+    #                     coords_torch[0][index][0] - 3,
+    #                     coords_torch[0][index][1] - 3,
+    #                     coords_torch[0][index][0] + 3,
+    #                     coords_torch[0][index][1] + 3,
+    #                 ),
+    #                 fill=(0, 0, 255),
+    #             )
+    #             imagedraw.point(
+    #                 (coords_torch[0][index][0], coords_torch[0][index][1]), (0, 255, 0)
+    #             )
+    #     img.save(f"saved_imgs/{step}_points.png")
+    # pd.DataFrame(iou_list).to_csv(
+    #     f"saved_csvs/{args.model_path.split('/')[-1].split('.')[0]}.csv"
+    # )
 
 
 if __name__ == "__main__":
