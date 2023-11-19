@@ -69,13 +69,13 @@ def add_decomposed_rel_pos(
     Rh = get_rel_pos(q_h, k_h, rel_pos_h)
     Rw = get_rel_pos(q_w, k_w, rel_pos_w)
 
-    B, _, dim = q.shape
-    r_q = q.reshape(B, q_h, q_w, dim)
+    # B, _, dim = q.shape
+    # r_q = q.reshape(B, q_h, q_w, dim)
     # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     # or not use torch.einsum:
-    rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
+    rel_h = torch.matmul(q, Rh.transpose(1, 2))
     # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
-    rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
+    rel_w = torch.matmul(q, Rw.transpose(1, 2))
 
     return rel_h, rel_w
 
@@ -113,11 +113,9 @@ class QuantAttention(nn.Module):
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = (
             self.qkv_proj(x)
-            .reshape(B, H * W, 3, self.num_heads, -1)
-            .permute(2, 0, 3, 1, 4)
         )
         # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H, W, -1).unbind(0)
+        q = qkv.reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).reshape(3, B * self.num_heads, H, W, -1)[0]
 
         # attn = (q * self.scale) @ k.transpose(-2, -1)
 
@@ -126,11 +124,11 @@ class QuantAttention(nn.Module):
                 q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
             x = forward(
-                x,
+                qkv,
                 rel_h,
                 rel_w,
                 self.num_heads,
-                x.shape[-1],
+                q.shape[-1],
                 sm_scale=self.scale,
             ).to(x.dtype)
         else:
@@ -274,8 +272,8 @@ def _fwd_kernel1(
         ).to(
             tl.float32
         )  # [:, None, :]
-        qk += (b1 + b2) * 1.44269504
-        # qk += b2 #* 1.44269504
+        qk += b1 * 1.44269504
+        qk += b2 * 1.44269504
         qk = tl.where(
             (seq_len - start_n > offs_n[None, :])
             & (seq_len - start_m > offs_m[:, None]),
