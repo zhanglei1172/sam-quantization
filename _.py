@@ -48,8 +48,11 @@ def memory_runner(path, fn, *args, **kwargs):
 
 
 @torch.no_grad()
-def profile_warmup(input_image_batch):
+def profile_warmup(input_image_batch, use_compile=False):
+    global model
     with torch.autograd.profiler.record_function("compilation and warmup"):
+        if use_compile:
+            model = torch.compile(model, mode="max-autotune", fullgraph=False)
         for i in range(3):
             features_batch = model(input_image_batch)
 
@@ -61,7 +64,10 @@ def profile_run(input_image_batch):
 
 
 @torch.no_grad()
-def benchmark():
+def benchmark(use_compile=False):
+    global model
+    if use_compile:
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
     input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
     for i in range(3):
         features_batch = model(input_image_batch)
@@ -81,8 +87,8 @@ def benchmark():
 
 
 @torch.no_grad()
-def profile_pipeline(input_image_batch):
-    profile_warmup(input_image_batch)
+def profile_pipeline(input_image_batch, use_compile=False):
+    profile_warmup(input_image_batch, use_compile=use_compile)
     profile_run(input_image_batch)
 
 dtype = torch.bfloat16
@@ -92,5 +98,5 @@ if __name__ == "__main__":
     profiler_path = "./profiler"
     # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
 
-    # profiler_runner(profiler_path, profile_pipeline, input_image_batch)
-    benchmark()
+    # profiler_runner(profiler_path, profile_pipeline, input_image_batch, use_compile=True)
+    benchmark(use_compile=True)
