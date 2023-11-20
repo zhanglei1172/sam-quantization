@@ -107,36 +107,14 @@ class ImageEncoderViT(nn.Module):
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + self.pos_embed
-        # i = 0
+
         for blk in self.blocks:
-            # plot(x, i)
             x = blk(x)
-            # i += 1
 
         x = self.neck(x.permute(0, 3, 1, 2))
 
         return x
 
-def plot(x, i):
-    import numpy as np
-
-    # x : (1, 16, 16, 1280)
-    # plot per-channel range(min and max)
-    import matplotlib.pyplot as plt
-    plt.figure()
-    x = x.cpu().detach().numpy()
-    x = x.reshape(-1, x.shape[-1])
-    xmin = x.min(axis=0)
-    xmax = x.max(axis=0)
-    plt.plot(xmin, label="min")
-    plt.plot(xmax, label="max")
-    # plt.plot(np.abs(x).max(axis=0), label="abs_max")
-    # plt.plot(np.abs(x).min(axis=0), label="abs_min")
-    plt.legend()
-    plt.show()
-    plt.savefig(f"boxplot_{i}.png")
-    plt.close()
-    
 
 class Block(nn.Module):
     """Transformer blocks with support of window attention and residual propagation blocks"""
@@ -185,16 +163,13 @@ class Block(nn.Module):
 
         self.window_size = window_size
 
-    # @torch.jit.script_method
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
         # Window partition
-        H, W = x.shape[1], x.shape[2]
         if self.window_size > 0:
+            H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
-        else:
-            pad_hw = (0, 0)
 
         x = self.attn(x)
         # Reverse window partition
@@ -264,20 +239,6 @@ class Attention(nn.Module):
 
         return x
 
-def plot_attention(x):
-    # x: (400, 196, 196)
-    import numpy as np
-    import matplotlib.pyplot as plt
-    
-    plt.figure()
-    # plot value distribution
-    x = x.cpu().detach().numpy()
-    x = np.log(x).reshape(-1)
-    plt.hist(x, bins=100)
-    plt.savefig("attention.png")
-    plt.clf()
-    
-
 
 def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
@@ -292,21 +253,17 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     """
     B, H, W, C = x.shape
 
-    # pad_h = (window_size - H % window_size) % window_size # 6
-    # pad_w = (window_size - W % window_size) % window_size # 6
-    pad_h = 6
-    pad_w = 6
-    # if pad_h > 0 or pad_w > 0:
-    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h), value=0.0)
-    # Hp, Wp = H + pad_h, W + pad_w # 70, 70
-    Hp, Wp = 70, 70
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    Hp, Wp = H + pad_h, W + pad_w
 
-    # x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    x = x.view(1, 5, 14, 5, 14, 1280)
+    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows, (Hp, Wp)
 
-# @torch.jit.script
+
 def window_unpartition(
     windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
 ) -> torch.Tensor:
@@ -321,18 +278,17 @@ def window_unpartition(
     Returns:
         x: unpartitioned sequences with [B, H, W, C].
     """
-    Hp, Wp = 70, 70 #pad_hw # 70. 70
-    H, W = 64, 64 #hw # 64, 64
-    B = 1#windows.shape[0] // (Hp * Wp // window_size // window_size) # 1
-    # x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1) # 
-    x = windows.view(1, 5, 5, 14, 14, 1280)
+    Hp, Wp = pad_hw
+    H, W = hw
+    B = windows.shape[0] // (Hp * Wp // window_size // window_size)
+    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
-    # if Hp > H or Wp > W:
-    x = x[:, :H, :W, :].contiguous()
+    if Hp > H or Wp > W:
+        x = x[:, :H, :W, :].contiguous()
     return x
 
-# @torch.jit.script
+
 def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """
     Get relative positional embeddings according to the relative positions of
@@ -395,11 +351,8 @@ def add_decomposed_rel_pos(
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
-    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    # or not use torch.einsum:
-    rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
-    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
-    rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
+    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
