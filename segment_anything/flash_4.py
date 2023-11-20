@@ -26,124 +26,157 @@ import triton.language as tl
 import os
 import pathlib
 
-
 @triton.jit
-def _fwd_kernel_aligned(
-    Q, K, V, B0, sm_scale,
+def _fwd_kernel1(
+    INP,
+    POS_EMB1,
+    POS_EMB2,
+    seq_len,
+    batch_size,
+    head_num,
+    hidden_dim,
+    sm_scale,
     Out,
-    stride_qh, stride_qm, stride_qk,
-    stride_kh, stride_kn, stride_kk,
-    stride_vh, stride_vk, stride_vn,
-    stride_oh, stride_om, stride_on,
-    stride_b0h, stride_b0m,
-    Z,
-    H,
-    N_CTX,
-    P_SEQ,
-    OUT_DTYPE: tl.constexpr,
-    BIAS_LAST_SIZE: tl.constexpr,
-    B0_NUMEL: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+    emb_len,
+    stride_e,
+    qkv_offset,
+    seq_stride,
+    batch_stride,
+    head_stride,
     BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    q_offset = off_hz * stride_qh
-    kv_offset = off_hz * stride_kh
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + q_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, stride_qk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0)
+    start_m = tl.program_id(0) * BLOCK_M
+    head_batch_idx = tl.program_id(1)
+    head_idx = head_batch_idx % head_num
+    batch_idx = head_batch_idx // head_num
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_hidden = tl.arange(0, BLOCK_DMODEL)
+
+    q_ptrs = (
+        INP
+        + start_m * seq_stride
+        + head_idx * head_stride
+        + batch_idx * batch_stride
+        + (offs_m[:, None] * seq_stride + offs_hidden[None, :])
     )
-    K_block_ptr = tl.make_block_ptr(
-        base=K + kv_offset,
-        shape=(BLOCK_DMODEL, N_CTX + P_SEQ),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_DMODEL, BLOCK_N),
-        order=(0, 1)
+    k_ptrs = (
+        INP
+        + head_idx * head_stride
+        + batch_idx * batch_stride
+        + qkv_offset
+        + (offs_n[:, None] * seq_stride + offs_hidden[None, :])
     )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + kv_offset,
-        shape=(N_CTX + P_SEQ, BLOCK_DMODEL),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(1, 0)
+    v_ptrs = (
+        INP
+        + head_idx * head_stride
+        + batch_idx * batch_stride
+        + qkv_offset * 2
+        + (offs_n[:, None] * seq_stride + offs_hidden[None, :])
     )
 
-    # initialize offsets
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # l_i = tl.where(offs_m < N_CTX, l_i, 1)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    # scale sm_scale by log_2(e) and use
+    # credits to: Adam P. Goucher (https://github.com/apgoucher):
+    # scale sm_scale by 1/log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
     qk_scale = sm_scale * 1.44269504
     # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr)  # , boundary_check=(1, 0), padding_option="zero")
-    q = (q * qk_scale).to(OUT_DTYPE)
-    # loop over k, v and update accumulator
-    lo = 0
-    hi = N_CTX + P_SEQ
+    q = tl.load(
+        q_ptrs,
+        mask=(offs_hidden[None, :] < hidden_dim)
+        & (offs_m[:, None] < seq_len - start_m),
+        other=0.0,
+    )
+    q = (q * qk_scale).to(INP.dtype.element_ty)
+    b_ptrs1_ = POS_EMB1 + head_batch_idx * stride_e
+    b_ptrs2_ = POS_EMB2 + head_batch_idx * stride_e
 
-    b_ptr_offsets_m = tl.arange(0, BLOCK_M)
+    for start_n in range(0, seq_len, BLOCK_N):
+        _offs_emb1 = (offs_n + start_n) // emb_len
+        _offs_emb2 = (offs_n + start_n) % emb_len
+        b1_ptrs = b_ptrs1_ + (
+            (offs_m + start_m)[:, None] * emb_len + (_offs_emb1)[None, :]
+        )
+        b2_ptrs = b_ptrs2_ + (
+            (offs_m + start_m)[:, None] * emb_len + (_offs_emb2)[None, :]
+        )
 
-    b_offset = off_hz * stride_b0h
-    b_ptr_offsets_n_1 = (tl.arange(0, BLOCK_N) %
-                         BIAS_LAST_SIZE) + BIAS_LAST_SIZE
-    b1 = tl.load(B0 + b_offset + ((start_m * BLOCK_M + b_ptr_offsets_m)
-                 * stride_b0m)[:, None] + b_ptr_offsets_n_1[None, :])
-    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- load k, v --
-        # , boundary_check=(0, 1), padding_option="zero")
-        k = tl.load(K_block_ptr)
-        # , boundary_check=(1, 0), padding_option="zero")
-        v = tl.load(V_block_ptr)
+        k = tl.load(
+            k_ptrs + start_n * seq_stride,
+            mask=(offs_hidden[None, :] < hidden_dim)
+            & (offs_n[:, None] < seq_len - start_n),
+            other=0,
+        )
+        v = tl.load(
+            v_ptrs + start_n * seq_stride,
+            mask=(offs_hidden[None, :] < hidden_dim)
+            & (offs_n[:, None] < seq_len - start_n),
+            other=0,
+        )
         # -- compute qk ---
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=OUT_DTYPE)
-        qk += tl.dot(q, k, out_dtype=OUT_DTYPE)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, tl.trans(k), allow_tf32=True)
 
-        # -- compute rel_h[:, None] + rel_w[None, :] bias ---
-
-        # Bias
-        b0 = tl.load(B0 + b_offset + ((start_m * BLOCK_M + b_ptr_offsets_m)
-                     * stride_b0m)[:, None] + start_n // BLOCK_N)
-        qk += (b0 + b1) * 1.44269504
-
+        b1 = tl.load(
+            b1_ptrs,
+            mask=((offs_m[:, None] < seq_len - start_m))
+            & ((offs_n[None, :] < seq_len - start_n)),
+            other=0.0,
+        ).to(
+            tl.float32
+        )  # [:, :, None]
+        b2 = tl.load(
+            b2_ptrs,
+            mask=((offs_m[:, None] < seq_len - start_m))
+            & ((offs_n[None, :] < seq_len - start_n)),
+            other=0.0,
+        ).to(
+            tl.float32
+        )  # [:, None, :]
+        qk += b1 * 1.44269504
+        qk += b2 * 1.44269504
+        qk = tl.where(
+            (seq_len - start_n > offs_n[None, :])
+            & (seq_len - start_m > offs_m[:, None]),
+            qk,
+            float("-inf"),
+        )
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
-        acc *= alpha[:, None]
-        acc += tl.dot(p.to(OUT_DTYPE), v)
+        acc_scale = l_i * 0 + alpha  # workaround some compiler bug
+        acc *= acc_scale[:, None]
+        acc += tl.dot(p.to(INP.dtype.element_ty), v, allow_tf32=True)
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
-        # update pointers
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-
     # write back l and m
     acc = acc / l_i[:, None]
-
     # write back O
-    O_block_ptr = tl.make_block_ptr(
-        base=Out + q_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0)
+    O_ptrs = (
+        Out
+        + start_m * seq_stride // 3
+        + head_idx * head_stride
+        + batch_idx * batch_stride // 3
+        + (offs_m[:, None] * (seq_stride // 3) + offs_hidden[None, :])
     )
-    tl.store(O_block_ptr, acc.to(OUT_DTYPE))
-
+    tl.store(
+        O_ptrs,
+        acc.to(Out.dtype.element_ty),
+        mask=(offs_hidden[None, :] < hidden_dim)
+        & (offs_m[:, None] < seq_len - start_m),
+    )
 
 def _autotune(configs, function):
     import torch.utils.benchmark as benchmark
@@ -176,50 +209,47 @@ def _autotune(configs, function):
     return best, best_config
 
 
-def _attention_rel_h_rel_w_kernel_aligned_device(q, k, v, rel_h_w, sm_scale, o,
+def _attention_rel_h_rel_w_kernel_aligned_device(inp, rel_h, rel_w, sm_scale, head_num, hidden_dim, o,
                                                  BLOCK_M,
                                                  BLOCK_N,
                                                  num_warps,
                                                  num_stages):
-    _, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
-    assert q.size() == k.size()
-    assert q.size() == v.size()
-    assert q.size(-2) == rel_h_w.size(-2)
-    assert (q.dtype == torch.bfloat16 or q.dtype == torch.float16)
-    assert k.dtype == q.dtype
-    assert v.dtype == k.dtype
-    assert o.dtype == v.dtype
-    assert rel_h_w.dtype == q.dtype
-    assert rel_h_w.size(-1) == 128
+    assert (inp.dtype == torch.bfloat16 or inp.dtype == torch.float16)
+    assert o.dtype == inp.dtype
+    assert rel_h.dtype == inp.dtype
+    assert rel_w.dtype == inp.dtype
     # assert rel_h_w.size(-1) == 2 * BLOCK_N
+    batch, h, w, qkvhd = inp.shape
 
-    grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
-    # print("q.shape[0] * q.shape[1]: ", q.shape[0] * q.shape[1])
-    P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
-    assert P_SEQ == 0
-    assert rel_h_w.is_contiguous(), str(rel_h_w.stride())
-    _fwd_kernel_aligned[grid](
-        q, k, v,
-        rel_h_w,
+    BLOCK_HEADDIM = max(triton.next_power_of_2(hidden_dim), 16)
+    # assert Lk in {16, 32, 64, 128}
+    grid = (triton.cdiv(h * w, BLOCK_M), head_num * batch, 1)
+    qkv_offset = qkvhd // 3
+    _fwd_kernel1[grid](
+        inp,
+        rel_h,
+        rel_w,
+        h * w,
+        batch,
+        head_num,
+        hidden_dim,
         sm_scale,
         o,
-        q.stride(1), q.stride(2), q.stride(3),
-        k.stride(1), k.stride(2), k.stride(3),
-        v.stride(1), v.stride(2), v.stride(3),
-        o.stride(1), o.stride(2), o.stride(3),
-        rel_h_w.stride(1), rel_h_w.stride(2),
-        q.shape[0],
-        q.shape[1],
-        q.shape[2],
-        P_SEQ,
-        OUT_DTYPE=tl.float16 if q.dtype == torch.float16 else tl.bfloat16,
-        BIAS_LAST_SIZE=(rel_h_w.size(-1) // 2),
-        B0_NUMEL=rel_h_w.size(-1),
+        rel_h.shape[-1],
+        rel_h.stride(0),
+        qkv_offset,
+        inp.stride(2),
+        inp.stride(0),
+        hidden_dim,  # head_num stride
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=Lk,
+        BLOCK_DMODEL=BLOCK_HEADDIM,
         num_warps=num_warps,
-        num_stages=num_stages)
+        num_stages=num_stages,
+    )
+
+    return o
+
 
 
 def _load_best_configs():
@@ -259,42 +289,37 @@ def _save_best_configs(best_configs):
         pickle.dump(best_configs, f)
 
 
-def _create_best_configs_key(q, k, v, rel_h_w, o):
-    key = (q.size(),   k.size(),   v.size(),   rel_h_w.size(),   o.size(),
-           q.stride(), k.stride(), v.stride(), rel_h_w.stride(), o.stride())
+def _create_best_configs_key(inp, rel_h, rel_w, o):
+    key = (inp.size(),   rel_h.size(), rel_w.size(),   o.size(),
+           inp.stride(), rel_h.stride(), rel_w.stride(), o.stride())
     return key
 
 
 BEST_CONFIGS = None
 
 lib = torch.library.Library("customflash", "FRAGMENT")
-lib.define("custom_flash_aligned(Tensor q, Tensor k, Tensor v, Tensor rel_h_w, float sm_scale) -> Tensor")
+lib.define("custom_flash_aligned(Tensor inp, Tensor rel_h, Tensor rel_w, float sm_scale, int head_num, int hidden_dim) -> Tensor")
 
 
 # All that's needed for torch.compile support
 @torch.library.impl(lib, "custom_flash_aligned", "Meta")
-def _attention_rel_h_rel_w_kernel_aligned_meta(q, k, v, rel_h_w, sm_scale):
-    return q.contiguous()
+def _attention_rel_h_rel_w_kernel_aligned_meta(inp, rel_h, rel_w, sm_scale, head_num, hidden_dim):
+    return inp[..., :head_num*hidden_dim].contiguous()
 
 
 @torch.library.impl(lib, "custom_flash_aligned", "CUDA")
-def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
+def _attention_rel_h_rel_w_kernel_aligned(inp, rel_h, rel_w, sm_scale, head_num, hidden_dim):
     # This is likely not needed, but without it the kernel
     # is guaranteed to fail. If the inputs are already contiguous
     # these are cheap checks via is_contiguous and do nothing.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    # shape constraints
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-    assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
-    o = torch.empty_like(q, memory_format=torch.contiguous_format)
+    inp = inp.contiguous()
+    b, h, w, _ = inp.shape
+    o = torch.empty(b, h, w, head_num*hidden_dim, dtype=inp.dtype, device=inp.device, memory_format=torch.contiguous_format)
 
     global BEST_CONFIGS
     if BEST_CONFIGS is None:
         BEST_CONFIGS = _load_best_configs()
-    key = _create_best_configs_key(q, k, v, rel_h_w, o)
+    key = _create_best_configs_key(inp, rel_h, rel_w, o)
     if key not in BEST_CONFIGS:
         print("key ", key, " not found. Running autotune. This might take a while.")
         import functools
@@ -305,7 +330,7 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
                 configs.append((BLOCK_M, BLOCK_N, num_warps, num_stages))
         print("all configs len: ", len(configs))
         best, best_config = _autotune(configs, functools.partial(_attention_rel_h_rel_w_kernel_aligned_device,
-                                                                 q, k, v, rel_h_w, sm_scale, o))
+                                                                 inp, rel_h, rel_w, sm_scale, head_num, hidden_dim, o))
         BEST_CONFIGS[key] = best_config
         print("Found best_config ", best_config,
               " with time ", best, " for key ", key)
@@ -314,11 +339,12 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
     if best_config is None:
         return torch.tensor([])
 
-    _attention_rel_h_rel_w_kernel_aligned_device(q,
-                                                 k,
-                                                 v,
-                                                 rel_h_w,
+    _attention_rel_h_rel_w_kernel_aligned_device(inp,
+                                                 rel_h,
+                                                 rel_w,
                                                  sm_scale,
+                                                 head_num,
+                                                 hidden_dim,
                                                  o,
                                                  best_config[0],
                                                  best_config[1],
@@ -331,38 +357,17 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
 USE_CUSTOM_KERNEL = bool(int(os.environ.get('segment_anything_USE_FLASH_4', 1)))
 
 
-def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
+def _attention_rel_h_rel_w(inp, rel_h, rel_w, head_num, hidden_dim, sm_scale):
     """
     Writing this as a composite allows torch.compile to fuse
     the needed padding into previous operations and memory
     allocations.
     """
+    
 
-    import math
-    sm_scale = 1. / math.sqrt(q_.size(-1))
-    # Check if second last dimension is multiple of 256
-    q_size_2_padded = (((q_.size(-2) + 256 - 1) // 256) * 256) - q_.size(-2)
 
-    def kernel_guards(q_, k_, v_):
-        return (q_.dtype == torch.bfloat16 or q_.dtype == torch.float16) and q_.dtype == k_.dtype and k_.dtype == v_.dtype and USE_CUSTOM_KERNEL
-    # vit_b and vit_l
-    if q_size_2_padded == 0 and q_.size(-1) == 64 and kernel_guards(q_, k_, v_):
-        rel_h_w = torch.cat([rel_h_.squeeze(-1), rel_w_.squeeze(-2)], dim=-1)
-        o = torch.ops.customflash.custom_flash_aligned(
-            q_, k_, v_, rel_h_w, sm_scale)
-        if o.numel() > 0:
-            return o
-    # vit_h
-    if q_size_2_padded == 0 and q_.size(-1) == 80 and kernel_guards(q_, k_, v_):
-        # Only support multiples of 64, so need to pad
-        q = torch.nn.functional.pad(q_, (0, 128 - 80, 0, 0), "constant", 0)
-        k = torch.nn.functional.pad(k_, (0, 128 - 80, 0, 0), "constant", 0)
-        v = torch.nn.functional.pad(v_, (0, 128 - 80, 0, 0), "constant", 0)
-        rel_h_w = torch.cat([rel_h_.squeeze(-1), rel_w_.squeeze(-2)], dim=-1)
-        o = torch.ops.customflash.custom_flash_aligned(
-            q, k, v, rel_h_w, sm_scale)
-        if o.numel() > 0:
-            return o[:, :, :, :80]
-    attn_bias = (rel_h_ + rel_w_).view(q_.size(0), q_.size(1),
-                                       rel_h_.size(2), rel_h_.size(3) * rel_w_.size(4))
-    return torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_bias)
+    return torch.ops.customflash.custom_flash_aligned(
+        inp, rel_h, rel_w, sm_scale, head_num, hidden_dim)
+
+
+    
