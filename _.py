@@ -62,7 +62,7 @@ def profile_run(input_image_batch):
 
 @torch.no_grad()
 def benchmark():
-    input_image_batch = torch.randn(1, 3, 1024, 1024).cuda()
+    input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
     for i in range(3):
         features_batch = model(input_image_batch)
     torch.cuda.synchronize()
@@ -85,10 +85,12 @@ def profile_pipeline(input_image_batch):
     profile_warmup(input_image_batch)
     profile_run(input_image_batch)
 
+dtype = torch.bfloat16
+model.to(dtype)
 
 if __name__ == "__main__":
     profiler_path = "./profiler"
-    # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda()
+    # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
 
     # profiler_runner(profiler_path, profile_pipeline, input_image_batch)
     benchmark()
