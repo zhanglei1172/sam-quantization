@@ -12,6 +12,7 @@ from typing import Optional, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
+from segment_anything.flash_4 import _attention_rel_h_rel_w
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -228,13 +229,25 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        rel_h, rel_w = None, None
+        if self.use_rel_pos:
+            rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+
+        q = q.view(B, self.num_heads, H * W, -1)
+        k = k.view(B, self.num_heads, H * W, -1)
+        v = v.view(B, self.num_heads, H * W, -1)
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            rel_h = rel_h.view(B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3))
+            rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
+            # attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
+            # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+        else:
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+
         x = self.proj(x)
 
         return x
@@ -323,7 +336,6 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
 
 
 def add_decomposed_rel_pos(
-    attn: torch.Tensor,
     q: torch.Tensor,
     rel_pos_h: torch.Tensor,
     rel_pos_w: torch.Tensor,
@@ -353,12 +365,12 @@ def add_decomposed_rel_pos(
     r_q = q.reshape(B, q_h, q_w, dim)
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_h = rel_h.unsqueeze(-1)
+    rel_w = rel_w.unsqueeze(-2)
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)
 
-    attn = (
-        attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
-    ).view(B, q_h * q_w, k_h * k_w)
-
-    return attn
+    return rel_h, rel_w
 
 
 class PatchEmbed(nn.Module):
