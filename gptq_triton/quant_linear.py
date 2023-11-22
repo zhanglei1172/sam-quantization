@@ -10,9 +10,9 @@ from typing import Optional
 
 from .utils import matmul4_kernel_config_pruner
 
-workspace = torch.empty([20971520], dtype=torch.float16, device="cuda")
+workspace = torch.empty([20971520], dtype=torch.bfloat16, device="cuda")
 
-def make_quant(model, bits, groupsize):
+def make_quant(model, bits, groupsize, quantizers=None):
     """
     Replace all linear layers in a model with quantized ones.
     Except for the lm_head, which is not quantized.
@@ -21,7 +21,9 @@ def make_quant(model, bits, groupsize):
         if not isinstance(m, nn.Linear):
             continue
 
-        if name == "lm_head":
+        # if "attn.proj" in name:
+            # continue
+        if quantizers and name not in quantizers:
             continue
 
         # Replace the linear layer with a quantized one
@@ -47,7 +49,7 @@ def autotune_warmup(model):
     print(f"QuantLinear Warmup: Found {len(kn_values)} unique KN values.")
 
     def func(m, k, qweight, scales, qzeros, groupsize):
-        a = torch.randn(1, m, k, dtype=torch.float16, device="cuda")
+        a = torch.randn(1, m, k, dtype=torch.bfloat16, device="cuda")
         triton_matmul4(groupsize, a, qweight, scales, qzeros)
 
     return (
@@ -101,11 +103,11 @@ class QuantLinear(nn.Module):
         self.register_buffer(
             "scales",
             torch.empty(
-                (math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16
+                (math.ceil(infeatures / groupsize), outfeatures), dtype=torch.bfloat16
             ),
         )
         if bias:
-            self.register_buffer("bias", torch.empty(outfeatures, dtype=torch.float16))
+            self.register_buffer("bias", torch.empty(outfeatures, dtype=torch.bfloat16))
         else:
             self.register_parameter("bias", None)
 
@@ -336,20 +338,20 @@ def matmul4_kernel(
 
         # Now we need to unpack b (which is 4-bit values) into 32-bit values
         b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
-        b = b * scales[None, :] - zeros[None, :]  # Scale and shift
+        b = (b * scales[None, :] - zeros[None, :]).to(c_ptr.dtype.element_ty)  # Scale and shift
 
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
 
-    c = accumulator.to(tl.float16)
+    c = accumulator.to(c_ptr.dtype.element_ty)
 
     # Store the result
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 def triton_matmul4(

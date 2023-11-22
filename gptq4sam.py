@@ -25,7 +25,7 @@ from data.datasets.sbd import SBDDataset
 from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from gptq import *
-from gptq_triton import QuantLinear, quant_linear
+from gptq_triton import QuantLinear, load_quant, quant_linear
 from PIL import Image
 
 # from quant import *
@@ -56,226 +56,6 @@ def get_sampler(dataset, shuffle, distributed):
         return torch.utils.data.SequentialSampler(dataset)
 
 
-def quantize_layer(layer, inps, nsamples, dev):
-    outs = []
-    if args.nearest:
-        subset = find_layers(layer)
-        for name in subset:
-            quantizer = Quantizer()
-            quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
-            W = subset[name].weight.data
-            quantizer.find_params(W, weight=True)
-            subset[name].weight.data = quantize(
-                W, quantizer.scale, quantizer.zero, quantizer.maxq
-            ).to(next(iter(layer.parameters())).dtype)
-    for j in range(nsamples):
-        outs.append(layer(inps[j : j + 1]))
-    # layers[i] = layer.cpu()
-    # del layer
-    # outs = torch.cat(outs, dim=0)
-    torch.cuda.empty_cache()
-    return layer, inps, outs
-
-
-@torch.no_grad()
-def quantize_image_encoder(model, images, dev):
-    nsamples = len(images)
-
-    torch.cuda.empty_cache()
-    # model.patch_embed = model.patch_embed.to(dev)
-    layer = model.patch_embed.to(dev)
-    layer, _, inps = quantize_layer(
-        layer,
-        images,
-        nsamples,
-        dev,
-    )
-    inps = torch.cat(inps, dim=0)
-    model.patch_embed = layer.cpu()
-    del layer
-    torch.cuda.empty_cache()
-    if model.pos_embed is not None:
-        inps += model.pos_embed.to(dev)
-
-    # outs = torch.zeros_like(inps)
-    layers = model.blocks
-    for i in range(len(layers)):
-        print(i)
-        layer = layers[i].to(dev)
-
-        layer, inps, outs = quantize_layer(layer, inps, nsamples, dev)
-        layers[i] = layer.cpu()
-        del layer
-        torch.cuda.empty_cache()
-        inps, outs = torch.cat(outs, dim=0), inps
-
-    layer = model.neck.to(dev)
-    layer, inps, outs = quantize_layer(layer, inps.permute(0, 3, 1, 2), nsamples, dev)
-    model.neck = layer.cpu()
-    del layer
-    torch.cuda.empty_cache()
-    return torch.cat(outs, dim=0)
-
-
-@torch.no_grad()
-def quantize_prompt_encoder(model, dev, points=None, boxes=None, masks=None):
-    layer = model.to(dev)
-    torch.cuda.empty_cache()
-    sparse_embeddings = None
-    bs = model._get_batch_size(points, boxes, masks)
-    sparse_embeddings = torch.empty(
-        (bs, 0, model.embed_dim), device=model._get_device()
-    )
-    if points is not None:
-        coords, labels = points
-        point_embeddings = model._embed_points(coords, labels, pad=(boxes is None))
-        sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
-    if boxes is not None:
-        box_embeddings = model._embed_boxes(boxes)
-        sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
-
-    if masks is not None:
-        layer, inps, dense_embeddings = quantize_layer(
-            layer.mask_downscaling, masks, len(masks), dev
-        )
-        dense_embeddings = torch.cat(dense_embeddings, dim=0)
-    else:
-        dense_embeddings = model.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            bs, -1, model.image_embedding_size[0], model.image_embedding_size[1]
-        )
-
-    model = layer.cpu()
-    del layer
-    torch.cuda.empty_cache()
-    return sparse_embeddings, dense_embeddings
-
-
-@torch.no_grad()
-def quantize_mask_decoder(
-    model,
-    dev,
-    image_embeddings,
-    image_pe,
-    sparse_prompt_embeddings,
-    dense_prompt_embeddings,
-    multimask_output=False,
-):
-    layer = model.to(dev)
-    torch.cuda.empty_cache()
-
-    outs = []
-
-    subset = find_layers(layer)
-    for name in subset:
-        quantizer = Quantizer()
-        quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
-        W = subset[name].weight.data
-        quantizer.find_params(W, weight=True)
-        subset[name].weight.data = quantize(
-            W, quantizer.scale, quantizer.zero, quantizer.maxq
-        ).to(next(iter(layer.parameters())).dtype)
-    for j in range(len(image_embeddings)):
-        outs.append(
-            layer.predict_masks(
-                image_embeddings=image_embeddings[j : j + 1],
-                image_pe=image_pe,
-                sparse_prompt_embeddings=sparse_prompt_embeddings[j : j + 1],
-                dense_prompt_embeddings=dense_prompt_embeddings[j : j + 1],
-            )
-        )
-    masks, iou_pred = zip(*outs)
-    torch.cuda.empty_cache()
-
-    model = layer.cpu()
-    del layer
-    torch.cuda.empty_cache()
-
-    if multimask_output:
-        mask_slice = slice(1, None)
-    else:
-        mask_slice = slice(0, 1)
-    masks = torch.cat(masks, dim=0)[:, mask_slice, :, :]
-    iou_pred = torch.cat(iou_pred, dim=0)[:, mask_slice]
-
-    # Prepare output
-    return masks, iou_pred
-
-
-@torch.no_grad()
-def quantize_model(model, data, dev):
-    print("Evaluating ...")
-
-    nsamples = len(data)
-
-    # for i in range(nsamples):
-    #     batch = testloader[i:i+1].to(dev)
-    #     try:
-    #         model(batch)
-    #     except ValueError:
-    #         pass
-    images, gt_masks, points = [], [], []
-    for batch_data in data:
-        images.append(batch_data["images"])
-        gt_masks.append(batch_data["instances"])
-        points.append(batch_data["points"])
-
-    # dtype = next(iter(model.parameters())).dtype
-
-    images, gt_masks, points = (
-        torch.cat(images, dim=0).to(dev),
-        torch.cat(gt_masks, dim=0).to(dev),
-        torch.cat(points, dim=0).to(dev),
-    )
-    torch.cuda.empty_cache()
-    image_embedding = quantize_image_encoder(model.image_encoder, images, dev)
-    prev_masks = torch.zeros_like(gt_masks)
-    # sparse_embeddings, dense_embeddings = model.prompt_encoder(
-    #     input_points=input_points,
-    #     input_labels=input_labels,
-    #     input_boxes=input_boxes,
-    #     input_masks=input_masks,
-    # )
-    click_points = []
-    click_labels = []
-    batch_points, batch_labels = get_next_click_torch(prev_masks, gt_masks)
-
-    points_co = torch.cat(batch_points, dim=0).to(dev)
-    points_la = torch.cat(batch_labels, dim=0).to(dev)
-
-    click_points.append(points_co)
-    click_labels.append(points_la)
-
-    points_multi = torch.cat(click_points, dim=1).to(dev)
-    labels_multi = torch.cat(click_labels, dim=1).to(dev)
-
-    points_input = points_multi
-    labels_input = labels_multi
-
-    prev_masks = torch.zeros_like(gt_masks)
-    low_res_masks = F.interpolate(
-        prev_masks.float(), size=(crop_size[0] // 4, crop_size[1] // 4)
-    )
-    sparse_embeddings, dense_embeddings = quantize_prompt_encoder(
-        model.prompt_encoder,
-        dev,
-        points=[points_input, labels_input],
-        boxes=None,
-        masks=low_res_masks,  # TODO
-    )
-
-    low_res_masks, iou_predictions = quantize_mask_decoder(
-        model.mask_decoder,
-        dev,
-        image_embedding,
-        model.prompt_encoder.get_dense_pe().to(dev),
-        sparse_embeddings,
-        dense_embeddings,
-        multimask_output=False,
-    )
-
-    torch.save(model.state_dict(), f"./checkpoints/sam-{args.wbits}.pt")
-
-
 @torch.no_grad()
 def sam_sequential(
     model,
@@ -288,7 +68,7 @@ def sam_sequential(
     percdamp: float,
     groupsize: int,
     act_order: bool,
-    name_prefix=""
+    name_prefix="",
 ):
     # Prepare
     layers = model.blocks
@@ -385,11 +165,13 @@ def sam_sequential(
 
             # With the data collected, quantize the layers
             for name in subset:
+                # if i != 1:
+                #     continue
                 print(i, name)
                 scale, zero = gptq[name].fasterquant(
                     percdamp=percdamp, groupsize=groupsize, actorder=act_order
                 )
-                quantizers[name_prefix+"blocks.%d.%s" % (i, name)] = (
+                quantizers[name_prefix + "blocks.%d.%s" % (i, name)] = (
                     gptq[name].quantizer,
                     scale,
                     zero,
@@ -420,7 +202,7 @@ def sam_pack(model, quantizers, wbits: int, groupsize: int):
     layers = {n: layers[n] for n in quantizers}
 
     # Replace all applicable instances of Linear with QuantLinear in the model
-    quant_linear.make_quant(model, wbits, groupsize)
+    quant_linear.make_quant(model, wbits, groupsize, quantizers)
 
     for name, m in tqdm(model.named_modules(), total=len(list(model.named_modules()))):
         if not isinstance(m, QuantLinear):
@@ -632,7 +414,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
     )
 
-    model.half()
+    model.to(torch.bfloat16)
+    # main(model.to(DEV), val_data, args, device)
     # eval_origin(model, testloader, DEV)
     # quantize_model(model, train_data, DEV)
     quantizers = sam_sequential(
@@ -646,7 +429,7 @@ if __name__ == "__main__":
         args.percdamp,
         args.groupsize,
         args.act_order,
-        name_prefix=""
+        name_prefix="",
     )
     args.save = Path(args.save)
     args.save.mkdir(parents=True, exist_ok=True)
@@ -662,4 +445,5 @@ if __name__ == "__main__":
             )
         )
     # model.load_state_dict(torch.load(f"./checkpoints/sam-{args.wbits}.pt"))
+    model = load_quant(model, args.save, sub_module="image_encoder", fuse_mlp=False)
     main(model.to(DEV), val_data, args, device)

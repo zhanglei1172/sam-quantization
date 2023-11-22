@@ -215,11 +215,11 @@ if __name__ == "__main__":
     )
 
     # bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.float32, device)
-    model.half()
+    model.to(torch.bfloat16)
     # bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.float16, device)
 
     model = load_quant(model, args.save, sub_module="image_encoder", fuse_mlp=False)
     model.eval()
-    bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.float16, device)
+    bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.bfloat16, device)
 
     main(model.to(DEV), val_data, args, device)

@@ -149,7 +149,7 @@ class GPTQ:
 
         torch.cuda.synchronize()
         print("time %.2f" % (time.time() - tick))
-        print("error", torch.sum(Losses).item())
+        print("error", torch.sum(Losses).item()/self.nsamples)
 
         if actorder:
             invperm = torch.argsort(perm)
