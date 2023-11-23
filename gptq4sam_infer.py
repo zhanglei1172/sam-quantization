@@ -216,10 +216,12 @@ if __name__ == "__main__":
 
     # bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.float32, device)
     model.to(torch.bfloat16)
+    # main(model.to(DEV), val_data, args, device)
     # bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.float16, device)
 
     model = load_quant(model, args.save, sub_module="image_encoder", fuse_mlp=False)
     model.eval()
+    torch.cuda.empty_cache()
     bench_speed(model.image_encoder, (1, 3, 1024, 1024), torch.bfloat16, device)
 
     main(model.to(DEV), val_data, args, device)
