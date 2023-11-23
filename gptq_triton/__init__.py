@@ -9,7 +9,7 @@ from . import fused_mlp, quant_linear
 from .fused_attention import QuantAttention, make_quant_attn
 
 # from .fused_mlp import make_fused_mlp
-from .quant_linear import QuantLinear, make_quant, triton_matmul4
+from .quant_linear import QuantLinear, make_quant
 
 
 def load_quant(
@@ -89,16 +89,16 @@ def autotune_warmup(model):
     The intended use is to run this on startup so the autotuner doesn't have to run during
     actual inference.
     """
-    from tqdm import tqdm
+    # from tqdm import tqdm
 
-    warmups = itertools.chain(
-        quant_linear.autotune_warmup(model)
-    )
-    warmups = list(warmups)
+    # warmups = itertools.chain(
+    quant_linear.autotune_warmup_linear(model)
+    # )
+    # warmups = list(warmups)
 
-    print("Warming up autotune cache ...")
-    with torch.no_grad():
-        for m in tqdm(range(0, 12)):
-            m = 2**m
-            for func in warmups:
-                func(m)
+    # print("Warming up autotune cache ...")
+    # with torch.no_grad():
+    #     for m in tqdm(range(0, 12)):
+    #         m = 2**m
+    #         for func in warmups:
+    #             func(m)

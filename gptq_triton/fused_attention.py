@@ -111,11 +111,13 @@ class QuantAttention(nn.Module):
         """Input shape: Batch x Time x Channel"""
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
-        qkv = (
-            self.qkv_proj(x)
-        )
+        qkv = self.qkv_proj(x)
         # q, k, v with shape (B * nHead, H * W, C)
-        q = qkv.reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).reshape(3, B * self.num_heads, H, W, -1)[0]
+        q = (
+            qkv.reshape(B, H * W, 3, self.num_heads, -1)
+            .permute(2, 0, 3, 1, 4)
+            .reshape(3, B * self.num_heads, H, W, -1)[0]
+        )
 
         # attn = (q * self.scale) @ k.transpose(-2, -1)
 

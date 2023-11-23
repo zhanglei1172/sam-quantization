@@ -5,6 +5,7 @@ import torch.nn as nn
 import math
 import time
 import transformers
+from texttable import Texttable
 
 DEBUG = False
 
@@ -25,21 +26,26 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
+        self.quantizer = Quantizer()
 
     def add_batch(self, inp, out):
+        # Hessian H = 2 X XT + λ I
         if DEBUG:
             self.inp1 = inp
             self.out1 = out
+        else:
+            self.inp1 = None
+            self.out1 = None
+
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
-        # tmp = inp.shape[0]
-        tmp = 1 # TODO for sam only 1 sample
+        tmp = 1  # TODO inp.shape[0] for sam only 1 sample
         if isinstance(self.layer, nn.Linear) or isinstance(
             self.layer, transformers.Conv1D
         ):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
-            if len(inp.shape) == 4:
+            elif len(inp.shape) == 4:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
         if isinstance(self.layer, nn.Conv2d):
@@ -59,7 +65,40 @@ class GPTQ:
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
 
-    def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1, actorder=False):
+    def print_loss(self, name, q_weight, weight_error, timecost):
+        table = Texttable()
+        name += " " * (16 - len(name))
+
+        table.header(["name", "weight_error", "fp_inp_SNR", "q_inp_SNR", "time"])
+
+        # assign weight
+        self.layer.weight.data = q_weight.reshape(self.layer.weight.shape).to(
+            self.layer.weight.data.dtype
+        )
+
+        if self.inp1 is not None:
+            # quantize input to int8
+            quantizer = Quantizer()
+            quantizer.configure(8, perchannel=False, sym=True, mse=False)
+            quantizer.find_params(self.inp1)
+            q_in = quantizer.quantize(self.inp1).type(torch.float16)
+            q_out = self.layer(q_in)
+
+            # get kinds of SNR
+            q_SNR = torch_snr_error(q_out, self.out1).item()
+            fp_SNR = torch_snr_error(self.layer(self.inp1), self.out1).item()
+        else:
+            q_SNR = "-"
+            fp_SNR = "-"
+
+        table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
+        print(table.draw().split("\n")[-2])
+
+    def fasterquant(
+        self, blocksize=128, percdamp=0.01, groupsize=-1, actorder=False, name=""
+    ):
+        self.layer.to(self.dev)
+
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
@@ -94,6 +133,7 @@ class GPTQ:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
+        g_idx = []
         scale = []
         zero = []
         now_idx = 1
@@ -123,12 +163,7 @@ class GPTQ:
                         zero.append(self.quantizer.zero)
                         now_idx += 1
 
-                q = quantize(
-                    w.unsqueeze(1),
-                    self.quantizer.scale,
-                    self.quantizer.zero,
-                    self.quantizer.maxq,
-                ).flatten()
+                q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d**2
 
@@ -141,39 +176,34 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-            if DEBUG:
-                self.layer.weight.data[:, :i2] = Q[:, :i2]
-                self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                print(torch.sum(Losses))
-
         torch.cuda.synchronize()
-        print("time %.2f" % (time.time() - tick))
-        print("error", torch.sum(Losses).item()/self.nsamples)
+        error = torch.sum(Losses).item() / self.nsamples
 
+        groupsize = groupsize if groupsize != -1 else self.columns
+        g_idx = [i // groupsize for i in range(self.columns)]
+        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
         if actorder:
             invperm = torch.argsort(perm)
             Q = Q[:, invperm]
+            g_idx = g_idx[invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
-        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
+
+        self.print_loss(
+            name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick)
         )
-        if DEBUG:
-            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
         if scale == []:
             scale.append(self.quantizer.scale)
             zero.append(self.quantizer.zero)
         scale = torch.cat(scale, dim=1)
         zero = torch.cat(zero, dim=1)
-        return scale, zero
+        return scale, zero, g_idx, error
 
     def free(self):
-        if DEBUG:
-            self.inp1 = None
-            self.out1 = None
+        self.inp1 = None
+        self.out1 = None
         self.H = None
         self.Losses = None
         self.Trace = None
@@ -214,6 +244,13 @@ class Quantizer(nn.Module):
         self.maxshrink = maxshrink
         if trits:
             self.maxq = torch.tensor(-1)
+        self.scale = torch.zeros_like(self.scale)
+
+    def _quantize(self, x, scale, zero, maxq):
+        if maxq < 0:
+            return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
+        q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+        return scale * (q - zero)
 
     def find_params(self, x, weight=False):
         dev = x.device
@@ -265,7 +302,9 @@ class Quantizer(nn.Module):
                 xmax1 = p * xmax
                 scale1 = (xmax1 - xmin1) / self.maxq
                 zero1 = torch.round(-xmin1 / scale1) if not self.sym else self.zero
-                q = quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
+                q = self._quantize(
+                    x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq
+                )
                 q -= x
                 q.abs_()
                 q.pow_(self.norm)
@@ -300,7 +339,8 @@ class Quantizer(nn.Module):
 
     def quantize(self, x):
         if self.ready():
-            return quantize(x, self.scale, self.zero, self.maxq)
+            return self._quantize(x, self.scale, self.zero, self.maxq)
+
         return x
 
     def enabled(self):

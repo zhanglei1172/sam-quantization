@@ -2,7 +2,7 @@ import math
 import triton
 
 
-def matmul4_kernel_config_pruner(configs, nargs):
+def matmul248_kernel_config_pruner(configs, nargs):
     """
     The main purpose of this function is to shrink BLOCK_SIZE_* when the corresponding dimension is smaller.
     """

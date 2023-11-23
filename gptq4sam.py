@@ -26,6 +26,7 @@ from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from gptq import *
 from gptq_triton import QuantLinear, load_quant, quant_linear
+from utils.modelutils import find_layers
 from PIL import Image
 
 # from quant import *
@@ -119,6 +120,11 @@ def sam_sequential(
     # Layers are quantized in order, and only one layer lives on the GPU at a time to save memory
     # Otherwise quantizing large models would be impossible (NOTE for future readers: are you enjoying your 1TB VRAM?)
     for i, layer in tqdm(enumerate(layers), total=len(layers)):
+        print(f"Quantizing layer {i+1}/{len(layers)}..")
+        print("+------------------+--------------+------------+-----------+-------+")
+        print("|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |")
+        print("+==================+==============+============+===========+=======+")
+
         layer = layer.to(device)
         full = {
             name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)
@@ -141,7 +147,6 @@ def sam_sequential(
             # Prepare a quantizer for each linear layer
             for name in subset:
                 gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer = Quantizer()
                 gptq[name].quantizer.configure(
                     wbits, perchannel=True, sym=sym, mse=False
                 )
@@ -168,13 +173,19 @@ def sam_sequential(
                 # if i != 1:
                 #     continue
                 print(i, name)
-                scale, zero = gptq[name].fasterquant(
-                    percdamp=percdamp, groupsize=groupsize, actorder=act_order
+                scale, zero, g_idx, error = gptq[name].fasterquant(
+                    percdamp=percdamp,
+                    groupsize=groupsize,
+                    actorder=act_order,
+                    name=name,
                 )
                 quantizers[name_prefix + "blocks.%d.%s" % (i, name)] = (
-                    gptq[name].quantizer,
-                    scale,
-                    zero,
+                    gptq[name].quantizer.cpu(),
+                    scale.cpu(),
+                    zero.cpu(),
+                    g_idx.cpu(),
+                    args.wbits,
+                    args.groupsize,
                 )
                 gptq[name].free()
 
@@ -192,6 +203,8 @@ def sam_sequential(
 
         # Swap buffers
         inps, outs = outs, inps
+        print("+------------------+--------------+------------+-----------+-------+")
+        print("\n")
 
     return quantizers
 
@@ -203,80 +216,13 @@ def sam_pack(model, quantizers, wbits: int, groupsize: int):
 
     # Replace all applicable instances of Linear with QuantLinear in the model
     quant_linear.make_quant(model, wbits, groupsize, quantizers)
-
-    for name, m in tqdm(model.named_modules(), total=len(list(model.named_modules()))):
-        if not isinstance(m, QuantLinear):
-            continue
-
-        quantizer, scale, zero = quantizers[name]
-        quantizer, scale, zero = quantizer.cpu(), scale.cpu(), zero.cpu()
-        pack_linear(m, layers[name].weight.data, scale, zero, layers[name].bias.data)
-
-
-def pack_linear(
-    quant,
-    weights: torch.FloatTensor,
-    scales: torch.FloatTensor,
-    zeros,
-    bias: Optional[torch.FloatTensor],
-):
-    """
-    Packs the quantized weights, scales, and zero points into a QuantLinear layer
-    """
-    scales = scales.t().contiguous()
-    zeros = zeros.t().contiguous()
-    scale_zeros = zeros * scales
-
-    quant.scales = scales.clone().to(torch.float16)
-
-    if quant.bias is not None:
-        quant.bias = bias.clone().to(torch.float16)
-
-    # Round weights to nearest integer based on scale and zero point
-    # Each weight will be one int, but should not exceed quant.bits
-    intweight = []
-    for idx in range(quant.infeatures):
-        g_idx = idx // quant.groupsize
-        # TODO: This is oddly complex.  The `gptq.quantize` function does `return scale * (q - zero)`, so shouldn't
-        # this just be `q = torch.round((weights[:,idx] / scales[g_idx]) + zero[g_idx])`?
-        q = torch.round((weights[:, idx] + scale_zeros[g_idx]) / scales[g_idx]).to(
-            torch.int32
-        )
-        intweight.append(q[:, None])
-    intweight = torch.cat(intweight, dim=1)
-    intweight = intweight.t().contiguous()
-
-    # Now pack the weights into uint32's
-    # qweight = torch.zeros((intweight.shape[0] // 32 * quant.bits, intweight.shape[1]), dtype=torch.int32)
-    quant.qweight.zero_()
-    i = 0
-    row = 0
-    while row < quant.qweight.shape[0]:
-        if quant.bits in [2, 4, 8]:
-            for j in range(i, i + (32 // quant.bits)):
-                quant.qweight[row] |= intweight[j] << (quant.bits * (j - i))
-            i += 32 // quant.bits
-            row += 1
-        else:
-            raise NotImplementedError("Only 2,4,8 bits are supported.")
-
-    # Subtract 1 from the zero point
-    zeros = zeros - 1
-
-    # Pack the zero points into uint32's
-    zeros = zeros.to(torch.int32)
-    # qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // 256 * (self.bits * 8)), dtype=np.uint32)
-    quant.qzeros.zero_()
-    i = 0
-    col = 0
-    while col < quant.qzeros.shape[1]:
-        if quant.bits in [2, 4, 8]:
-            for j in range(i, i + (32 // quant.bits)):
-                quant.qzeros[:, col] |= zeros[:, j] << (quant.bits * (j - i))
-            i += 32 // quant.bits
-            col += 1
-        else:
-            raise NotImplementedError("Only 2,4,8 bits are supported.")
+    qlayers = find_layers(model, [QuantLinear])
+    print("Packing ...")
+    for name in qlayers:
+        print(name)
+        quantizers[name], scale, zero, g_idx, _, _ = quantizers[name]
+        # pack_linear(m, layers[name].weight.data, scale, zero, layers[name].bias.data)
+        qlayers[name].pack(layers[name], scale, zero, g_idx)
 
 
 if __name__ == "__main__":

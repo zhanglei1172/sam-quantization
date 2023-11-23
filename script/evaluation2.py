@@ -249,6 +249,8 @@ def main(sam_model, val_data, args, device):
             batch_data["instances"].to(dtype),
             batch_data["points"].to(dtype),
         )
+        if not gt_masks.any():
+            continue
         prev_masks = torch.zeros_like(gt_masks).to(device)
 
         if backend == "ORT":
