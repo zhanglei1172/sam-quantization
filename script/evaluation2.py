@@ -258,7 +258,8 @@ def main(sam_model, val_data, args, device):
             )
             image_embedding = torch.cat(trt_outputs).to(device)
         else:
-            image_embedding = sam_model.image_encoder(images)  # (B, 256, 64, 64
+            dtype = next(sam_model.parameters()).dtype
+            image_embedding = sam_model.image_encoder(images.to(dtype))  # (B, 256, 64, 64
 
         click_points = []
         click_labels = []
@@ -326,48 +327,48 @@ def main(sam_model, val_data, args, device):
 
         # print(batch_data['instances'].unique())
         # print(batch_data)
-        img = ToPILImage()(batch_data["images"][0])
-        mask = ToPILImage()(batch_data["instances"][0])
-        img.save(f"saved_imgs/{step}_img.png")
-        mask.save(f"saved_imgs/{step}_mask.png")
-        pred_mask = ToPILImage()(pred_masks[0])
-        pred_mask.save(f"saved_imgs/{step}_pred_mask.png")
+        # img = ToPILImage()(batch_data["images"][0])
+        # mask = ToPILImage()(batch_data["instances"][0])
+        # img.save(f"saved_imgs/{step}_img.png")
+        # mask.save(f"saved_imgs/{step}_mask.png")
+        # pred_mask = ToPILImage()(pred_masks[0])
+        # pred_mask.save(f"saved_imgs/{step}_pred_mask.png")
 
-        imagedraw = ImageDraw.Draw(img)
+        # imagedraw = ImageDraw.Draw(img)
 
-        for index in range(len(coords_torch[0])):
-            # print(coords_torch)
-            # print(coords_torch[0][0])
-            if labels_torch[0][index] == 0:
-                imagedraw.point(
-                    (coords_torch[0][index][0], coords_torch[0][index][1]), (255, 0, 0)
-                )
-                imagedraw.ellipse(
-                    (
-                        coords_torch[0][index][0] - 3,
-                        coords_torch[0][index][1] - 3,
-                        coords_torch[0][index][0] + 3,
-                        coords_torch[0][index][1] + 3,
-                    ),
-                    fill=(255, 0, 0),
-                )
-            else:
-                imagedraw.ellipse(
-                    (
-                        coords_torch[0][index][0] - 3,
-                        coords_torch[0][index][1] - 3,
-                        coords_torch[0][index][0] + 3,
-                        coords_torch[0][index][1] + 3,
-                    ),
-                    fill=(0, 0, 255),
-                )
-                imagedraw.point(
-                    (coords_torch[0][index][0], coords_torch[0][index][1]), (0, 255, 0)
-                )
-        img.save(f"saved_imgs/{step}_points.png")
-    pd.DataFrame(iou_list).to_csv(
-        f"saved_csvs/{args.model_path.split('/')[-1].split('.')[0]}.csv"
-    )
+        # for index in range(len(coords_torch[0])):
+        #     # print(coords_torch)
+        #     # print(coords_torch[0][0])
+        #     if labels_torch[0][index] == 0:
+        #         imagedraw.point(
+        #             (coords_torch[0][index][0], coords_torch[0][index][1]), (255, 0, 0)
+        #         )
+        #         imagedraw.ellipse(
+        #             (
+        #                 coords_torch[0][index][0] - 3,
+        #                 coords_torch[0][index][1] - 3,
+        #                 coords_torch[0][index][0] + 3,
+        #                 coords_torch[0][index][1] + 3,
+        #             ),
+        #             fill=(255, 0, 0),
+        #         )
+        #     else:
+        #         imagedraw.ellipse(
+        #             (
+        #                 coords_torch[0][index][0] - 3,
+        #                 coords_torch[0][index][1] - 3,
+        #                 coords_torch[0][index][0] + 3,
+        #                 coords_torch[0][index][1] + 3,
+        #             ),
+        #             fill=(0, 0, 255),
+        #         )
+        #         imagedraw.point(
+        #             (coords_torch[0][index][0], coords_torch[0][index][1]), (0, 255, 0)
+        #         )
+        # img.save(f"saved_imgs/{step}_points.png")
+    # pd.DataFrame(iou_list).to_csv(
+    #     f"saved_csvs/{args.model_path.split('/')[-1].split('.')[0]}.csv"
+    # )
 
 
 if __name__ == "__main__":
