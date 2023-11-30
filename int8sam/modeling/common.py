@@ -7,13 +7,14 @@
 import torch
 import torch.nn as nn
 
-from torch_int.nn.linear import (
+from triton_int.nn.linear import (
     DanymicW8A8BFP32OFP32Linear,
     W8A8B8O8Linear,
     W8A8B8O8LinearReLU,
     W8A8BFP32OFP32Linear,
 )
 from typing import Type
+
 
 class MLPBlock(nn.Module):
     def __init__(

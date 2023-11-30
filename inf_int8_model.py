@@ -63,7 +63,7 @@ model_type = {
 }
 mt = "vit_h"
 dtype = torch.bfloat16
-model_int8 = int8_sam_model_registry[mt](checkpoint=model_type[mt]).to("cuda").to(dtype)
+model_int8 = int8_sam_model_registry[mt](checkpoint=model_type[mt])
 
 
 parser = argparse.ArgumentParser()
@@ -132,10 +132,11 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-model_int8.load_state_dict(torch.load("./out/int8sam.pt"))
+# model_int8.to(torch.bfloat16)
+# model_int8.load_state_dict(torch.load("./out/int8sam.pt", map_location="cuda"))
 model_int8.eval()
 
-main(model_int8.to(torch.bfloat16).to("cuda"), val_data, args, "cuda")
+main(model_int8.to("cuda"), val_data, args, "cuda")
 # os.makedirs(os.path.dirname("./out/act_scales.pt"), exist_ok=True)
 
 # torch.save(act_scales, args.output_path)

@@ -8,11 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segment_anything.flash_4 import _attention_rel_h_rel_w
+# from segment_anything.flash_4 import _attention_rel_h_rel_w
 
 from functools import partial
-from torch_int.nn.fused import LayerNormQ
-from torch_int.nn.linear import (
+from triton_int.nn.fused import LayerNormQ
+from triton_int.nn.linear import (
     DanymicW8A8BFP32OFP32Linear,
     W8A8B8O8Linear,
     W8A8B8O8LinearReLU,
