@@ -10,15 +10,15 @@ from torchvision.transforms import ToPILImage
 from segment_anything.build_sam import sam_model_registry
 
 import pandas as pd
-import tensorrt as trt
-import trt_infer
+# import tensorrt as trt
+# import trt_infer
 from albumentations import *
 from data.datasets.sbd import SBDDataset
 from data.points_sampler import MultiPointSampler
 from data.transforms import UniformRandomResize
 from PIL import ImageDraw
 from ppq import convert_any_to_numpy, convert_any_to_torch_tensor
-from ppq.utils.TensorRTUtil import trt
+# from ppq.utils.TensorRTUtil import trt
 from typing import List
 
 # crop_size = (1024, 1024)

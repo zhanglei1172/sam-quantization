@@ -1,7 +1,8 @@
 import torch
-import time
+
 from segment_anything.build_sam import sam_model_registry
 
+import time
 
 model_type = {
     "vit_b": "./checkpoints/sam_vit_b_01ec64.pth",
@@ -99,4 +100,4 @@ if __name__ == "__main__":
     # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
 
     # profiler_runner(profiler_path, profile_pipeline, input_image_batch, use_compile=True)
-    benchmark(use_compile=True)
+    benchmark(use_compile=False)

@@ -133,8 +133,9 @@ parser.add_argument(
 args = parser.parse_args()
 
 # model_int8.to(torch.bfloat16)
-# model_int8.load_state_dict(torch.load("./out/int8sam.pt", map_location="cuda"))
+model_int8.load_state_dict(torch.load("./out/int8sam.pt", map_location="cuda"))
 model_int8.eval()
+model_int8.to(torch.bfloat16)
 
 main(model_int8.to("cuda"), val_data, args, "cuda")
 # os.makedirs(os.path.dirname("./out/act_scales.pt"), exist_ok=True)

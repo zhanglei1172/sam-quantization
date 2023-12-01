@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from segment_anything.flash_4 import _attention_rel_h_rel_w
+from segment_anything.flash_4 import _attention_rel_h_rel_w
 
 from functools import partial
 from triton_int.nn.fused import LayerNormQ
@@ -315,28 +315,31 @@ class Attention(nn.Module):
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = (
-            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        ).to(self.rel_pos_h.dtype)
+            self.qkv(x)
+        )
         # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        q = qkv.reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).reshape(3, B * self.num_heads, H, W, -1)[0]
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        # attn = (q * self.scale) @ k.transpose(-2, -1)
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(
-                attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+            rel_h, rel_w = add_decomposed_rel_pos(
+                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
-
-        attn = attn.softmax(dim=-1)
-        x = (
-            (attn @ v)
-            .view(B, self.num_heads, H, W, -1)
-            .permute(0, 2, 3, 1, 4)
-            .reshape(B, H, W, -1)
-        )
-        x = self.proj(x).to(self.rel_pos_h.dtype)
-
-        return x
+            x = _attention_rel_h_rel_w(
+                qkv,
+                rel_h,
+                rel_w,
+                self.num_heads,
+                q.shape[-1],
+                sm_scale=self.scale,
+            )
+        else:
+            raise NotImplementedError
+        
+        out = self.proj(x)
+        
+        return out
 
     @staticmethod
     @torch.no_grad()
@@ -460,7 +463,6 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
 
 
 def add_decomposed_rel_pos(
-    attn: torch.Tensor,
     q: torch.Tensor,
     rel_pos_h: torch.Tensor,
     rel_pos_w: torch.Tensor,
@@ -486,18 +488,15 @@ def add_decomposed_rel_pos(
     Rh = get_rel_pos(q_h, k_h, rel_pos_h)
     Rw = get_rel_pos(q_w, k_w, rel_pos_w)
 
-    B, _, dim = q.shape
-    r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    # B, _, dim = q.shape
+    # r_q = q.reshape(B, q_h, q_w, dim)
+    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    # or not use torch.einsum:
+    rel_h = torch.matmul(q, Rh.transpose(1, 2))
+    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_w = torch.matmul(q, Rw.transpose(1, 2))
 
-    attn = (
-        attn.view(B, q_h, q_w, k_h, k_w)
-        + rel_h[:, :, :, :, None]
-        + rel_w[:, :, :, None, :]
-    ).view(B, q_h * q_w, k_h * k_w)
-
-    return attn
+    return rel_h, rel_w
 
 
 class PatchEmbed(nn.Module):

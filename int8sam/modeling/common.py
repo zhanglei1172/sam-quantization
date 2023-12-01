@@ -44,7 +44,7 @@ class INTMLPBlock(nn.Module):
         self.act = act()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lin2(self.act(self.lin1(x).to(torch.bfloat16))).to(torch.bfloat16)
+        return self.lin2(self.act(self.lin1(x)))
 
     @staticmethod
     @torch.no_grad()
