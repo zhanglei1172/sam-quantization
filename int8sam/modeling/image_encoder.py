@@ -8,9 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segment_anything.flash_4 import _attention_rel_h_rel_w
-
+import triton
+import triton.language as tl
 from functools import partial
+from triton_int.functional.quantization import quantize_per_tensor_absmax
+from triton_int.kernels.utils import bmm_autotune
+from triton_int.nn.bmm import BMM_S8T_S8N_F32T, BMM_S8T_S8T_S8T
 from triton_int.nn.fused import LayerNormQ
 from triton_int.nn.linear import (
     DanymicW8A8BFP32OFP32Linear,
@@ -21,6 +24,165 @@ from triton_int.nn.linear import (
 from typing import Optional, Tuple, Type
 
 from .common import INTMLPBlock, LayerNorm2d
+
+# from segment_anything.flash_4 import _attention_rel_h_rel_w
+
+
+@bmm_autotune()
+@triton.jit
+def kernel_bmm_s8t_s8n_f32t(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    scale,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    X,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_batch_a,
+    stride_batch_b,
+    stride_batch_c,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+    pid_sp_k = tl.program_id(axis=1)
+    pid_batch = tl.program_id(axis=2)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # See above `Pointer Arithmetics` section for details
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = pid_sp_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = (
+        a_ptr
+        + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        + pid_batch * stride_batch_a
+    )
+    b_ptrs = (
+        b_ptr
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        + (pid_batch % X) * stride_batch_b
+    )
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        # If it is out of bounds, set it to 0.
+        a = tl.load(
+            a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K * SPLIT_K, other=0.0
+        )
+        b = tl.load(
+            b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K * SPLIT_K, other=0.0
+        )
+        # We accumulate along the K dimension.
+        accumulator += tl.dot(a, b)
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+    # You can fuse arbitrary activation functions here
+
+    c = accumulator.to(tl.float32) * scale
+    # -----------------------------------------------------------
+    # Write back the block of the output matrix C with masks.
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (
+        c_ptr
+        + stride_cm * offs_cm[:, None]
+        + stride_cn * offs_cn[None, :]
+        + pid_batch * stride_batch_c
+    )
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if SPLIT_K == 1:
+        tl.store(c_ptrs, c.to(c_ptr.dtype.element_ty), mask=c_mask)
+    else:
+        tl.atomic_add(c_ptrs, c.to(c_ptr.dtype.element_ty), mask=c_mask)
+
+
+def custom_bmm_s8t_s8n_f32t(a, b, scale: float, out=None, dtype=torch.float32):
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    # Check constraints.
+    tmp_shape = a.shape[:-1]
+    # a = a.view(-1, a.shape[-1])
+    # b = b.view(-1, b.shape[-1])
+    assert len(a.shape) == 4 and len(b.shape) == 3
+    assert a.shape[1] == b.shape[0]
+    assert a.shape[3] == b.shape[2], "Incompatible dimensions"
+    B, X, M, K = a.shape
+    X, N, K = b.shape
+    # Allocates output.
+    if out == None:
+        c = torch.zeros((B, X, M, N), device=a.device, dtype=dtype)
+    else:
+        c = out.fill_(0)
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        META["SPLIT_K"],
+        B * X,
+    )
+    kernel_bmm_s8t_s8n_f32t[grid](
+        a,
+        b,
+        c,
+        scale,
+        M,
+        N,
+        K,
+        X,
+        a.stride(1),
+        b.stride(0),
+        c.stride(1),
+        a.stride(2),
+        a.stride(3),
+        b.stride(1),
+        b.stride(2),
+        c.stride(2),
+        c.stride(3),
+    )
+    return c.view(*tmp_shape, N)
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -260,6 +422,7 @@ class Block(nn.Module):
         int8_module.attn = Attention.from_float(
             module.attn,
             layer_scales["qkv_input_scale"],
+            layer_scales["qkv_output_scale"],
             layer_scales["out_input_scale"],
         )
         int8_module.mlp = INTMLPBlock.from_float(
@@ -296,17 +459,28 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.qkv = W8A8BFP32OFP32Linear(dim, dim * 3)
-        self.proj = DanymicW8A8BFP32OFP32Linear(dim, dim)
-
+        self.qkv = W8A8B8O8Linear(dim, dim * 3)
+        self.proj = W8A8BFP32OFP32Linear(dim, dim)
+        self.qk_bmm = BMM_S8T_S8N_F32T(1.0)
+        self.pv_bmm = BMM_S8T_S8T_S8T(1.0)
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
             assert (
                 input_size is not None
             ), "Input size must be provided if using relative positional encoding."
             # initialize relative positional embeddings
-            self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
-            self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
+            self.rel_pos_h = nn.Parameter(
+                torch.zeros(2 * input_size[0] - 1, head_dim, dtype=torch.int8),
+                requires_grad=False,
+            )
+            self.rel_pos_w = nn.Parameter(
+                torch.zeros(2 * input_size[1] - 1, head_dim, dtype=torch.int8),
+                requires_grad=False,
+            )
+            self.rel_pos_h_bmm = BMM_S8T_S8N_F32T(1.0)
+            self.rel_pos_w_bmm = BMM_S8T_S8N_F32T(1.0)
+            self.register_buffer("rel_h_scale", torch.tensor(1.0))
+            self.register_buffer("rel_w_scale", torch.tensor(1.0))
 
     def forward(
         self,
@@ -315,37 +489,37 @@ class Attention(nn.Module):
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = (
-            self.qkv(x)
+            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         )
         # q, k, v with shape (B * nHead, H * W, C)
-        q = qkv.reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).reshape(3, B * self.num_heads, H, W, -1)[0]
+        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         # attn = (q * self.scale) @ k.transpose(-2, -1)
+        attn = self.qk_bmm(q, k)
 
         if self.use_rel_pos:
-            rel_h, rel_w = add_decomposed_rel_pos(
-                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+            attn = self.add_decomposed_rel_pos(
+                attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
-            x = _attention_rel_h_rel_w(
-                qkv,
-                rel_h,
-                rel_w,
-                self.num_heads,
-                q.shape[-1],
-                sm_scale=self.scale,
-            )
-        else:
-            raise NotImplementedError
-        
-        out = self.proj(x)
-        
-        return out
+
+        attn = attn.softmax(dim=-1)
+
+        x = (
+            self.pv_bmm(attn.mul_(127).round_().to(torch.int8), v)
+            .view(B, self.num_heads, H, W, -1)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(B, H, W, -1)
+        )
+        x = self.proj(x)
+
+        return x
 
     @staticmethod
     @torch.no_grad()
     def from_float(
         module,
         input_scale: float,
+        qkv_out_scale: float,
         out_input_scale: float,
     ):
         int8_module = Attention(
@@ -359,12 +533,70 @@ class Attention(nn.Module):
             else None,
         )
         if module.use_rel_pos:
-            int8_module.rel_pos_h = module.rel_pos_h
-            int8_module.rel_pos_w = module.rel_pos_w
-        int8_module.qkv = W8A8BFP32OFP32Linear.from_float(module.qkv, input_scale)
-        int8_module.proj = DanymicW8A8BFP32OFP32Linear.from_float(module.proj)
+            int8_h, scale_h = quantize_per_tensor_absmax(module.rel_pos_h.data)
+            int8_w, scale_w = quantize_per_tensor_absmax(module.rel_pos_w.data)
+            int8_module.rel_pos_h.data.copy_(int8_h)
+            int8_module.rel_pos_w.data.copy_(int8_w)
+            int8_module.rel_h_scale = qkv_out_scale * scale_h
+            int8_module.rel_w_scale = qkv_out_scale * scale_w
+        int8_module.qkv = W8A8B8O8Linear.from_float(
+            module.qkv, input_scale, qkv_out_scale
+        )
+        int8_module.proj = W8A8BFP32OFP32Linear.from_float(module.proj, out_input_scale)
+        int8_module.qk_bmm = BMM_S8T_S8N_F32T.from_scale(
+            qkv_out_scale * module.scale, qkv_out_scale
+        )
+        int8_module.pv_bmm = BMM_S8T_S8T_S8T.from_scale(
+            1.0 / 127, qkv_out_scale, out_input_scale
+        )
 
         return int8_module
+
+    def add_decomposed_rel_pos(
+        self,
+        attn: torch.Tensor,
+        q: torch.Tensor,
+        rel_pos_h: torch.Tensor,
+        rel_pos_w: torch.Tensor,
+        q_size: Tuple[int, int],
+        k_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Calculate decomposed Relative Positional Embeddings from :paper:`mvitv2`.
+        https://github.com/facebookresearch/mvit/blob/19786631e330df9f3622e5402b4a419a263a2c80/mvit/models/attention.py   # noqa B950
+        Args:
+            attn (Tensor): attention map.
+            q (Tensor): query q in the attention layer with shape (B, q_h * q_w, C).
+            rel_pos_h (Tensor): relative position embeddings (Lh, C) for height axis.
+            rel_pos_w (Tensor): relative position embeddings (Lw, C) for width axis.
+            q_size (Tuple): spatial sequence size of query q with (q_h, q_w).
+            k_size (Tuple): spatial sequence size of key k with (k_h, k_w).
+
+        Returns:
+            attn (Tensor): attention map with added relative positional embeddings.
+        """
+        q_h, q_w = q_size
+        k_h, k_w = k_size
+        Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+        Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+
+        B, _, dim = q.shape
+        r_q = q.reshape(B, q_h, q_w, dim)
+        # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+        # or not use torch.einsum:
+        # rel_h = torch.matmul(r_q, Rh.transpose(1, 2))
+        rel_h = custom_bmm_s8t_s8n_f32t(r_q, Rh, self.rel_h_scale.item())
+        # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+        # rel_w = torch.matmul(r_q, Rw.transpose(1, 2))
+        rel_w = custom_bmm_s8t_s8n_f32t(r_q, Rw, self.rel_w_scale.item())
+
+        attn = (
+            attn.view(B, q_h, q_w, k_h, k_w)
+            + rel_h[:, :, :, :, None]
+            + rel_w[:, :, :, None, :]
+        ).view(B, q_h * q_w, k_h * k_w)
+
+        return attn
 
 
 def window_partition(
@@ -460,43 +692,6 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
 
     return rel_pos_resized[relative_coords.long()]
-
-
-def add_decomposed_rel_pos(
-    q: torch.Tensor,
-    rel_pos_h: torch.Tensor,
-    rel_pos_w: torch.Tensor,
-    q_size: Tuple[int, int],
-    k_size: Tuple[int, int],
-) -> torch.Tensor:
-    """
-    Calculate decomposed Relative Positional Embeddings from :paper:`mvitv2`.
-    https://github.com/facebookresearch/mvit/blob/19786631e330df9f3622e5402b4a419a263a2c80/mvit/models/attention.py   # noqa B950
-    Args:
-        attn (Tensor): attention map.
-        q (Tensor): query q in the attention layer with shape (B, q_h * q_w, C).
-        rel_pos_h (Tensor): relative position embeddings (Lh, C) for height axis.
-        rel_pos_w (Tensor): relative position embeddings (Lw, C) for width axis.
-        q_size (Tuple): spatial sequence size of query q with (q_h, q_w).
-        k_size (Tuple): spatial sequence size of key k with (k_h, k_w).
-
-    Returns:
-        attn (Tensor): attention map with added relative positional embeddings.
-    """
-    q_h, q_w = q_size
-    k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
-
-    # B, _, dim = q.shape
-    # r_q = q.reshape(B, q_h, q_w, dim)
-    # rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    # or not use torch.einsum:
-    rel_h = torch.matmul(q, Rh.transpose(1, 2))
-    # rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
-    rel_w = torch.matmul(q, Rw.transpose(1, 2))
-
-    return rel_h, rel_w
 
 
 class PatchEmbed(nn.Module):
