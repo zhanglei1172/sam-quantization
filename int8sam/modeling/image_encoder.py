@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segment_anything.flash_4 import _attention_rel_h_rel_w
+from segment_anything.flash_4 import _attention_rel_h_rel_w, _int8_attention_rel_h_rel_w
 
 from functools import partial
 from triton_int.nn.fused import LayerNormQ
@@ -297,9 +297,10 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
 
         self.qkv = W8A8BFP32OFP32Linear(dim, dim * 3)
-        self.proj = DanymicW8A8BFP32OFP32Linear(dim, dim)
+        self.proj = W8A8BFP32OFP32Linear(dim, dim)
 
         self.use_rel_pos = use_rel_pos
+        self.register_buffer("qunat_scale_1", torch.tensor(1.0))
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -326,10 +327,11 @@ class Attention(nn.Module):
             rel_h, rel_w = add_decomposed_rel_pos(
                 q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
-            x = _attention_rel_h_rel_w(
+            x = _int8_attention_rel_h_rel_w(
                 qkv,
                 rel_h,
                 rel_w,
+                self.qunat_scale_1.item(),
                 self.num_heads,
                 q.shape[-1],
                 sm_scale=self.scale,
@@ -361,8 +363,9 @@ class Attention(nn.Module):
         if module.use_rel_pos:
             int8_module.rel_pos_h = module.rel_pos_h
             int8_module.rel_pos_w = module.rel_pos_w
+        int8_module.qunat_scale_1 = torch.tensor(1.0 / out_input_scale).to(int8_module.qunat_scale_1.dtype)
         int8_module.qkv = W8A8BFP32OFP32Linear.from_float(module.qkv, input_scale)
-        int8_module.proj = DanymicW8A8BFP32OFP32Linear.from_float(module.proj)
+        int8_module.proj = W8A8BFP32OFP32Linear.from_float(module.proj, out_input_scale)
 
         return int8_module
 

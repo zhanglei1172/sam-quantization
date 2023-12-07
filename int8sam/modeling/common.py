@@ -7,12 +7,8 @@
 import torch
 import torch.nn as nn
 
-from triton_int.nn.linear import (
-    DanymicW8A8BFP32OFP32Linear,
-    W8A8B8O8Linear,
-    W8A8B8O8LinearReLU,
-    W8A8BFP32OFP32Linear,
-)
+from triton_int.nn.fused import W8A8BFP32OFP32_GeLu_Q
+from triton_int.nn.linear import W8A8BFP32OFP32Linear
 from typing import Type
 
 
@@ -31,6 +27,7 @@ class MLPBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(x)))
 
+
 class INTMLPBlock(nn.Module):
     def __init__(
         self,
@@ -39,12 +36,13 @@ class INTMLPBlock(nn.Module):
         act: Type[nn.Module] = nn.GELU,
     ) -> None:
         super().__init__()
-        self.lin1 = W8A8BFP32OFP32Linear(embedding_dim, mlp_dim)
-        self.lin2 = DanymicW8A8BFP32OFP32Linear(mlp_dim, embedding_dim)
-        self.act = act()
+        assert act == nn.GELU
+        self.lin1 = W8A8BFP32OFP32_GeLu_Q(embedding_dim, mlp_dim)
+        self.lin2 = W8A8BFP32OFP32Linear(mlp_dim, embedding_dim)
+        # self.act = act()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lin2(self.act(self.lin1(x)))
+        return self.lin2(self.lin1(x))
 
     @staticmethod
     @torch.no_grad()
@@ -56,8 +54,12 @@ class INTMLPBlock(nn.Module):
         int8_module = MLPBlock(
             module.lin1.in_features, module.lin2.in_features, module.act.__class__
         )
-        int8_module.lin1 = W8A8BFP32OFP32Linear.from_float(module.lin1, input_scale)
-        int8_module.lin2 = DanymicW8A8BFP32OFP32Linear.from_float(module.lin2)
+        int8_module.lin1 = W8A8BFP32OFP32_GeLu_Q.from_float(
+            module.lin1, input_scale, lin2_input_scale
+        )
+        int8_module.lin2 = W8A8BFP32OFP32Linear.from_float(
+            module.lin2, lin2_input_scale
+        )
 
         return int8_module
 
