@@ -331,7 +331,7 @@ class Attention(nn.Module):
                 qkv,
                 rel_h,
                 rel_w,
-                self.qunat_scale_1.item(),
+                self.qunat_scale_1,
                 self.num_heads,
                 q.shape[-1],
                 sm_scale=self.scale,

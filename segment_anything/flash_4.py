@@ -163,7 +163,7 @@ def _int8_fwd_kernel1(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
     # write back l and m
-    acc = tl.math.round(quant_scale_1 * acc / l_i[:, None])
+    acc = tl.math.round(tl.load(quant_scale_1) * acc / l_i[:, None])
     # write back O
     O_ptrs = (
         Out
@@ -537,7 +537,7 @@ lib.define(
 )
 
 lib.define(
-    "int8_custom_flash_aligned(Tensor inp, Tensor rel_h, Tensor rel_w, float qunat_scale_1, float sm_scale, int head_num, int hidden_dim) -> Tensor"
+    "int8_custom_flash_aligned(Tensor inp, Tensor rel_h, Tensor rel_w, Tensor qunat_scale_1, float sm_scale, int head_num, int hidden_dim) -> Tensor"
 )
 
 
