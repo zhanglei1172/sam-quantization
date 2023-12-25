@@ -74,7 +74,7 @@ class MaskDecoder(nn.Module):
         image_pe: torch.Tensor,
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
-        multimask_output: bool,
+        # multimask_output: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -93,37 +93,24 @@ class MaskDecoder(nn.Module):
         """
 
         self_dtype = self.iou_prediction_head.layers[0].weight.dtype
-        if sparse_prompt_embeddings.is_nested:
-            assert dense_prompt_embeddings.is_nested
-            assert multimask_output
-            masks, iou_pred = self.predict_masks_nested(
-                image_embeddings=image_embeddings,
-                image_pe=image_pe,
-                sparse_prompt_embeddings=sparse_prompt_embeddings.to(self_dtype),
-                dense_prompt_embeddings=dense_prompt_embeddings.to(self_dtype),
-            )
-            return masks, iou_pred
-        else:
-            masks, iou_pred = self.predict_masks(
-                image_embeddings=image_embeddings,
-                image_pe=image_pe,
-                sparse_prompt_embeddings=sparse_prompt_embeddings.to(self_dtype),
-                dense_prompt_embeddings=dense_prompt_embeddings.to(self_dtype),
-            )
+        masks, iou_pred = self.predict_masks(
+            image_embeddings=image_embeddings,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_prompt_embeddings.to(self_dtype),
+            dense_prompt_embeddings=dense_prompt_embeddings.to(self_dtype),
+        )
 
         # Select the correct mask or masks for output
-        if multimask_output:
-            mask_slice = slice(1, None)
-        else:
-            mask_slice = slice(0, 1)
+        # if multimask_output:
+            # mask_slice = slice(1, None)
+        # else:
+        mask_slice = slice(0, 1)
         masks = masks[:, mask_slice, :, :]
         iou_pred = iou_pred[:, mask_slice]
 
-        if sparse_prompt_embeddings.is_nested:
-            return masks, iou_pred
 
-        if sparse_prompt_embeddings.dtype != self_dtype:
-            return masks.to(sparse_prompt_embeddings.dtype), iou_pred.to(sparse_prompt_embeddings.dtype)
+
+        return masks.to(sparse_prompt_embeddings.dtype), iou_pred.to(sparse_prompt_embeddings.dtype)
         # Prepare output
         return masks, iou_pred
 
@@ -141,9 +128,11 @@ class MaskDecoder(nn.Module):
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
         # Expand per-image data in batch direction to be per-mask
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        # src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        src = image_embeddings.unsqueeze(1).expand(-1, tokens.shape[0], -1, -1, -1).reshape(-1, image_embeddings.shape[1], image_embeddings.shape[2], image_embeddings.shape[2])
         src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        # pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        pos_src = image_pe.unsqueeze(1).expand(-1, tokens.shape[0], -1, -1, -1).reshape(-1, image_pe.shape[1], image_pe.shape[2], image_pe.shape[2])
         b, c, h, w = src.shape
 
         # Run the transformer
@@ -190,14 +179,16 @@ class MaskDecoder(nn.Module):
         mask_tokens_out = hs[..., 1 : (1 + self.num_mask_tokens), :]
 
         # Upscale mask embeddings and predict masks using the mask tokens
-        src = src.transpose(-2, -1).unflatten(-1, (h, w))
+        # src = src.transpose(-2, -1).unflatten(-1, (h, w))
+        src = src.transpose(-2, -1).reshape(src.shape[0], src.shape[1], src.shape[2], h, w)
         upscaled_embedding = self.output_upscaling(src)
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[..., i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=-2)
         h, w = upscaled_embedding.shape[-2:]
-        masks = (hyper_in @ upscaled_embedding.flatten(-2)).unflatten(-1, (h, w))
+        # masks = (hyper_in @ upscaled_embedding.flatten(-2)).unflatten(-1, (h, w))
+        masks = (hyper_in @ upscaled_embedding.flatten(-2)).reshape(upscaled_embedding.shape[0], upscaled_embedding.shape[1], upscaled_embedding.shape[2], h, w)
 
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)

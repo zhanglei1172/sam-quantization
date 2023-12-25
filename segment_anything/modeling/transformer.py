@@ -99,6 +99,7 @@ class TwoWayTransformer(nn.Module):
         q = queries + point_embedding
         k = keys + image_pe
         attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
+        # attn_out = wrapped_atten(self.final_attn_token_to_image, q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
 
@@ -153,9 +154,11 @@ class TwoWayAttentionBlock(nn.Module):
         # Self attention block
         if self.skip_first_layer_pe:
             queries = self.self_attn(q=queries, k=queries, v=queries)
+            # queries = wrapped_atten(self.self_attn, q=queries, k=queries, v=queries)
         else:
             q = queries + query_pe
             attn_out = self.self_attn(q=q, k=q, v=queries)
+            # attn_out = wrapped_atten(self.self_attn, q=q, k=q, v=queries)
             queries = queries + attn_out
         queries = self.norm1(queries)
 
@@ -163,6 +166,7 @@ class TwoWayAttentionBlock(nn.Module):
         q = queries + query_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
+        # attn_out = wrapped_atten(self.cross_attn_token_to_image, q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm2(queries)
 
@@ -175,6 +179,7 @@ class TwoWayAttentionBlock(nn.Module):
         q = queries + query_pe
         k = keys + key_pe
         attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
+        # attn_out = wrapped_atten(self.cross_attn_image_to_token, q=k, k=q, v=queries)
         keys = keys + attn_out
         keys = self.norm4(keys)
 
@@ -205,7 +210,8 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(self.internal_dim, embedding_dim)
 
     def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
-        x = x.unflatten(-1, (num_heads, -1))
+        # x = x.unflatten(-1, (num_heads, -1))
+        x = x.reshape(x.shape[0], x.shape[1], num_heads, -1)
         return x.transpose(-3, -2)  # B... x N_heads x N_tokens x C_per_head
 
     def _recombine_heads(self, x: Tensor) -> Tensor:
@@ -231,3 +237,8 @@ class Attention(nn.Module):
         out = self.out_proj(out)
 
         return out
+
+# @torch.fx.wrap
+# def wrapped_atten(attn, q, k, v):
+#     return attn(q, k, v)
+# torch.fx.wrap("torch._C._nn.scaled_dot_product_attention")
