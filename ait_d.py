@@ -1,17 +1,10 @@
 import numpy as np
 import torch
 
-from ait_segment_anything.build_sam import sam_model_registry as ait_sam_model_registry
-from ait_segment_anything.modeling.transformer import get_debug_nodes
 from segment_anything.build_sam import sam_model_registry
 
 import time
-
-# from segment_anything.modeling.transformer import wrapped_atten
-from aitemplate.compiler import compile_model, transform
-from aitemplate.compiler.base import Tensor
-from aitemplate.testing import detect_target
-
+from aitemplate.compiler.model import Model
 
 model_type = {
     "vit_b": "./checkpoints/sam_vit_b_01ec64.pth",
@@ -19,7 +12,7 @@ model_type = {
     "vit_h": "./checkpoints/sam_vit_h_4b8939.pth",
 }
 mt = "vit_h_d"
-model = ait_sam_model_registry[mt](checkpoint=None)  # .to("cuda")
+  # .to("cuda")
 model_ = sam_model_registry["vit_h"](
     checkpoint=model_type["vit_h"]
 ).mask_decoder  # .to("cuda")
@@ -124,10 +117,17 @@ def mark_output(y):
         y_shape = [d._attrs["values"][0] for d in y[i]._attrs["shape"]]
         print("output_{} shape: {}".format(i, y_shape))
 
-
 @torch.no_grad()
 def benchmark_acc_debug():
-    global model, model_
+    from segment_anything.modeling.transformer import wrapped_atten
+
+    from ait_segment_anything.build_sam import sam_model_registry as ait_sam_model_registry
+    from ait_segment_anything.modeling.transformer import get_debug_nodes
+    from aitemplate.compiler import compile_model, transform
+    from aitemplate.compiler.base import Tensor
+    from aitemplate.testing import detect_target
+    model = ait_sam_model_registry[mt](checkpoint=None)
+    global model_
     # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
     inputs_ait = [
         Tensor(x.shape, name=f"input_{i}", is_input=True) for i, x in enumerate(args)
@@ -180,7 +180,15 @@ def benchmark_acc_debug():
 
 @torch.no_grad()
 def benchmark_speed():
-    global model, model_
+    from segment_anything.modeling.transformer import wrapped_atten
+
+    from ait_segment_anything.build_sam import sam_model_registry as ait_sam_model_registry
+    from ait_segment_anything.modeling.transformer import get_debug_nodes
+    from aitemplate.compiler import compile_model, transform
+    from aitemplate.compiler.base import Tensor
+    from aitemplate.testing import detect_target
+    model = ait_sam_model_registry[mt](checkpoint=None)
+    global model_
     # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
     inputs_ait = [
         Tensor(x.shape, name=f"input_{i}", is_input=True) for i, x in enumerate(args)
@@ -194,6 +202,92 @@ def benchmark_speed():
     y_ait = [
         torch.empty(*[x.value() for x in y.shape()], device="cuda", dtype=torch.float16)
         for y in Y
+    ]
+
+    params_pt = model_.named_parameters()
+    params_ait = {k: None for k in exe_module.get_constant_names()}
+    for name, param in params_pt:
+        ait_name = (
+            name.replace(".", "_")
+            .replace("q_proj", "proj_q")
+            .replace("k_proj", "proj_k")
+            .replace("v_proj", "proj_v")
+            .replace("out_proj", "proj")
+        )
+        if ait_name not in params_ait:
+            print(ait_name)
+            continue
+        if len(param.shape) == 4 and "weight" in name:
+            params_ait[ait_name] = (
+                param.permute((0, 2, 3, 1)).contiguous().to(dtype).cuda()
+            )
+        else:
+            params_ait[f"{ait_name}"] = param.to(dtype).cuda()
+    for k, v in params_ait.items():
+        assert v is not None, k
+        exe_module.set_constant_with_tensor(
+            k,
+            v,
+        )
+    kwargs = {f"input_{i}": args[i] for i in range(len(args))}
+    bench_func(exe_module.run_with_tensors, [kwargs, y_ait])
+
+
+@torch.no_grad()
+def benchmark_acc_release():
+    import os
+    exe_module = Model(
+        os.path.join("C:/Users/islei/Downloads/AITemplate/tmp/ait_sam_decoder", "test.dll_"), 1
+    )
+    y_ait = [
+        torch.empty(1, 1, 256, 256, device="cuda", dtype=torch.float16)
+    ]
+
+    params_pt = model_.named_parameters()
+    params_ait = {k: None for k in exe_module.get_constant_names()}
+    for name, param in params_pt:
+        ait_name = (
+            name.replace(".", "_")
+            .replace("q_proj", "proj_q")
+            .replace("k_proj", "proj_k")
+            .replace("v_proj", "proj_v")
+            .replace("out_proj", "proj")
+        )
+        if ait_name not in params_ait:
+            print(ait_name)
+            continue
+        if len(param.shape) == 4 and "weight" in name:
+            params_ait[ait_name] = (
+                param.permute((0, 2, 3, 1)).contiguous().to(dtype).cuda()
+            )
+        else:
+            params_ait[f"{ait_name}"] = param.to(dtype).cuda()
+    for k, v in params_ait.items():
+        assert v is not None, k
+        exe_module.set_constant_with_tensor(
+            k,
+            v,
+        )
+    kwargs = {f"input_{i}": args[i] for i in range(len(args))}
+    exe_module.run_with_tensors(kwargs, y_ait)
+    print(y_ait)
+    # torch.save(y_ait, "y_ait.pth")
+    model_.to("cuda")
+    y_ref = model_(*(arg.to(torch.float32) for arg in args))[0].to(torch.float16)
+    print(y_ref - y_ait[0])
+    print(1)
+
+
+@torch.no_grad()
+def benchmark_speed_release():
+    global model, model_
+    # input_image_batch = torch.randn(1, 3, 1024, 1024).cuda().to(dtype)
+    import os
+    exe_module = Model(
+        os.path.join("C:/Users/islei/Downloads/AITemplate/tmp/ait_sam_decoder", "test.dll_"), 1
+    )
+    y_ait = [
+        torch.empty(1, 1, 256, 256, device="cuda", dtype=torch.float16)
     ]
 
     params_pt = model_.named_parameters()
@@ -250,5 +344,5 @@ if __name__ == "__main__":
         torch.randn(1, 256, 64, 64).cuda().to(dtype),
     ]
     # profiler_runner(profiler_path, profile_pipeline, input_image_batch, use_compile=True)
-    benchmark_speed()
-    # benchmark_acc_debug()
+    benchmark_speed_release()
+    benchmark_acc_release()

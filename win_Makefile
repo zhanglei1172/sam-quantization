@@ -1,0 +1,25 @@
+
+CC = nvcc
+CFLAGS = 
+fPIC_flag = -Xcompiler=-fPIC
+
+obj_files = fused_elementwise_201.obj permute021_9.obj permute021_10.obj fused_elementwise_202.obj concatenate_16.obj gemm_rcr_bias_179.obj split_180.obj reshape_18.obj permute_19.obj mem_eff_attention_26.obj gemm_rcr_bias_28.obj layernorm_30.obj fused_elementwise_204.obj gemm_rcr_bias_32.obj permute_34.obj gemm_rcr_bias_35.obj permute0213_37.obj bmm_ccr_add_176.obj mem_eff_attention_41.obj gemm_rcr_bias_43.obj fused_elementwise_205.obj gemm_rcr_bias_relu_189.obj gemm_rcr_bias_add_190.obj fused_elementwise_206.obj gemm_rcr_bias_187.obj split_188.obj gemm_rcr_bias_183.obj split_184.obj fused_elementwise_208.obj fused_elementwise_209.obj reshape_77.obj mem_eff_attention_82.obj gemm_rcr_bias_84.obj fused_elementwise_210.obj layernorm_87.obj fused_elementwise_211.obj fused_elementwise_213.obj fused_elementwise_214.obj fused_elementwise_216.obj reshape_125.obj fused_elementwise_217.obj fused_elementwise_218.obj dynamic_slice_141.obj dynamic_slice_142.obj gemm_rcr_bias_relu_193.obj transposed_conv2d_bias_162.obj layernorm_163.obj fused_elementwise_219.obj transposed_conv2d_bias_165.obj fused_elementwise_220.obj gemm_rcr_bias_168.obj gemm_rcr_bias_169.obj gemm_rcr_bias_170.obj gemm_rcr_bias_171.obj bmm_rcr_173.obj dynamic_slice_175.obj concatenate_177_constant_folding.obj concatenate_185_constant_folding.obj concatenate_181_constant_folding.obj concatenate_13_constant_folding.obj concatenate_178_constant_folding.obj concatenate_186_constant_folding.obj concatenate_182_constant_folding.obj constants.obj model_container_base.obj model_interface.obj debug_utility.obj utility.obj model_container.obj
+
+%.obj : %.cu
+	nvcc -t=0 -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -w -gencode="arch=compute_80,code=[sm_80,compute_80]" -O3 -std=c++17 --expt-relaxed-constexpr -DCUTLASS_DEBUG_TRACE_LEVEL=0 -DNDEBUG --use_fast_math -DAIT_USE_FAST_MATH=1 -Xcompiler=-fPIC -Xcompiler=-fno-strict-aliasing -Xcompiler -fvisibility=hidden -I../../3rdparty/../static/include/kernels -I../../3rdparty/cutlass/include -I../../3rdparty/cutlass/tools/util/include -I../../3rdparty/cutlass/examples/35_gemm_softmax -I../../3rdparty/cutlass/examples/41_fused_multi_head_attention -I../../3rdparty/cutlass/examples/45_dual_gemm -I../../3rdparty/cutlass/../../python/aitemplate/backend/cuda/attention/src/./ -I../../3rdparty/cutlass/../../python/aitemplate/backend/cuda/attention/src/fmha  -Id:/Users/islei/miniconda3/envs/com/include -c -o $@ $<
+%.obj : %.bin
+	ld -r -b binary -o $@ $< && objcopy --rename-section .data=.lrodata,alloc,load,readonly,data,contents $@ $@
+
+.PHONY: all clean clean_constants
+all: test.so
+
+test.so: $(obj_files)
+	$(CC) -shared $(fPIC_flag) $(CFLAGS) -Ld:\Users\islei\miniconda3\envs\com\Lib\x64\ -o $@ $(obj_files)
+
+
+
+clean:
+	rm -f *.obj test.so
+
+clean_constants:
+	rm -f constants.bin
